@@ -352,13 +352,24 @@ describe("ReviewOrchestrator fix round 1", () => {
   });
 
   it("does not adopt a planned reviewer missing target acceptance criteria", async () => {
-    const w = new FakeDeliveryWorld(planView([
-      planTaskView("impl", { acceptanceCriteria: ["AC-1", "AC-2"] }),
-      planTaskView("partial-review", { role: "reviewer", dependsOn: ["impl"], acceptanceCriteria: ["AC-1"] }),
-    ]));
+    const w = new FakeDeliveryWorld(
+      planView([
+        planTaskView("impl", { acceptanceCriteria: ["AC-1", "AC-2"] }),
+        planTaskView("partial-review", {
+          role: "reviewer",
+          dependsOn: ["impl"],
+          acceptanceCriteria: ["AC-1"],
+        }),
+      ]),
+    );
     w.addTask("impl", "mt_impl", "crw_impl");
     w.addTask("partial-review", "mt_partial", "crw_rev", { template: "reviewer" });
-    const reviews = new ReviewOrchestrator({ db: openDatabase(":memory:"), executions: w, mimir: w, content: w });
+    const reviews = new ReviewOrchestrator({
+      db: openDatabase(":memory:"),
+      executions: w,
+      mimir: w,
+      content: w,
+    });
     const review = await reviews.requestReview(w.executionId, "impl");
     expect(review.origin).toBe("created");
     expect(review.reviewerTaskId).not.toBe("mt_partial");
@@ -386,22 +397,39 @@ describe("ReviewOrchestrator fix round 1", () => {
     expect(w.calls.map((c) => c.method)).not.toContain("createTask");
   });
   it("collects a shared planned review without rejecting another assigned criterion", async () => {
-    const w = new FakeDeliveryWorld(planView([
-      planTaskView("impl-a", { acceptanceCriteria: ["AC-1"] }),
-      planTaskView("impl-b", { acceptanceCriteria: ["AC-2"] }),
-      planTaskView("review-area", { role: "reviewer", dependsOn: ["impl-a", "impl-b"], acceptanceCriteria: ["AC-1", "AC-2"] }),
-    ]));
+    const w = new FakeDeliveryWorld(
+      planView([
+        planTaskView("impl-a", { acceptanceCriteria: ["AC-1"] }),
+        planTaskView("impl-b", { acceptanceCriteria: ["AC-2"] }),
+        planTaskView("review-area", {
+          role: "reviewer",
+          dependsOn: ["impl-a", "impl-b"],
+          acceptanceCriteria: ["AC-1", "AC-2"],
+        }),
+      ]),
+    );
     w.addTask("impl-a", "mt_a", "crw_impl");
     w.addTask("impl-b", "mt_b", "crw_impl");
     w.addTask("review-area", "mt_rev", "crw_rev", { template: "reviewer" });
-    const reviews = new ReviewOrchestrator({ db: openDatabase(":memory:"), executions: w, mimir: w, content: w });
+    const reviews = new ReviewOrchestrator({
+      db: openDatabase(":memory:"),
+      executions: w,
+      mimir: w,
+      content: w,
+    });
     const a = await reviews.requestReview(w.executionId, "impl-a");
     const b = await reviews.requestReview(w.executionId, "impl-b");
-    w.artifact("mt_rev", REVIEW_ARTIFACT_KIND, reviewJson({ acceptance: [
-      { criterionId: "AC-1", satisfied: true }, { criterionId: "AC-2", satisfied: true },
-    ] }));
+    w.artifact(
+      "mt_rev",
+      REVIEW_ARTIFACT_KIND,
+      reviewJson({
+        acceptance: [
+          { criterionId: "AC-1", satisfied: true },
+          { criterionId: "AC-2", satisfied: true },
+        ],
+      }),
+    );
     expect(await reviews.collect(a.id)).toMatchObject({ status: "completed", verdict: "approve" });
     expect(await reviews.collect(b.id)).toMatchObject({ status: "completed", verdict: "approve" });
   });
-
 });

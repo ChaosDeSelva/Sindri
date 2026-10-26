@@ -89,7 +89,12 @@ export function Layout(props: { children: ReactNode }) {
       </a>
       <header className="border-b border-slate-300 dark:border-slate-700">
         <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-4 px-4 py-3">
-          <h1 className="project-brand text-2xl font-semibold"><span className="project-initial" aria-hidden="true">S</span>Sindri</h1>
+          <h1 className="project-brand text-2xl font-semibold">
+            <span className="project-initial" aria-hidden="true">
+              S
+            </span>
+            Sindri
+          </h1>
           <nav aria-label="Main" aria-describedby="nav-shortcuts" className="flex-1">
             <ul className="flex flex-wrap gap-1">
               {VIEWS.map((v, i) => (

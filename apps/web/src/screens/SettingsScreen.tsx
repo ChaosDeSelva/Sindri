@@ -106,17 +106,20 @@ export function SettingsScreen() {
                       <option value="opencode">OpenCode (experimental)</option>
                       <option value="gemini">Gemini CLI (experimental)</option>
                       <option value="pi">Pi (experimental)</option>
-<option value="pi-signed">pi-signed (experimental; interactive backend)</option>
-<option value="grok">grok (experimental; interactive backend)</option>
-<option value="kimi">kimi (experimental; interactive backend)</option>
-<option value="cursor">cursor (experimental; interactive backend)</option>
-<option value="muse">muse (experimental; interactive backend)</option>
-<option value="rovo">rovo (experimental; interactive backend)</option>
-<option value="omp">omp (experimental; interactive backend)</option>
-<option value="agy">agy (experimental; interactive backend)</option>
-<option value="devin">devin (experimental; interactive backend)</option>
-<option value="commandcode">commandcode (experimental; interactive backend)</option>
-
+                      <option value="pi-signed">
+                        pi-signed (experimental; interactive backend)
+                      </option>
+                      <option value="grok">grok (experimental; interactive backend)</option>
+                      <option value="kimi">kimi (experimental; interactive backend)</option>
+                      <option value="cursor">cursor (experimental; interactive backend)</option>
+                      <option value="muse">muse (experimental; interactive backend)</option>
+                      <option value="rovo">rovo (experimental; interactive backend)</option>
+                      <option value="omp">omp (experimental; interactive backend)</option>
+                      <option value="agy">agy (experimental; interactive backend)</option>
+                      <option value="devin">devin (experimental; interactive backend)</option>
+                      <option value="commandcode">
+                        commandcode (experimental; interactive backend)
+                      </option>
                     </select>
                   </Field>
                 ))}
