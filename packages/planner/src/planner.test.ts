@@ -5,8 +5,15 @@ import { openDatabase, openKnowledge, type SqliteDatabase } from "@sindri/knowle
 import { openSpecs, type SpecBody, type Specification, type Specs } from "@sindri/specs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PlanValidationError } from "./dag.js";
-import { openPlanner, PlanStateError, SKELETON_MARKER, type Planner } from "./planner.js";
+import {
+  openPlanner,
+  PlanStateError,
+  PlanUntrustedError,
+  SKELETON_MARKER,
+  type Planner,
+} from "./planner.js";
 import type { PlanTask } from "./schema.js";
+import { FAREWELL_ACS, GREET_FIX_ACS } from "./live-plans.test-helpers.js";
 
 const UI_SKILLS = ["react-architecture", "accessibility", "tailwind", "component-design"];
 
@@ -98,6 +105,43 @@ describe("planner", () => {
     provider = new FakeProvider(filler()),
     svc: HarnessService = harnesses,
   ) => planner.propose(spec, { provider, harnesses: svc });
+
+  describe("stored rows written outside the planner", () => {
+    it("refuses an approved spec whose stored body has no acceptance criteria", async () => {
+      // The specs API refuses to approve such a spec; a row edited before approval is the only way.
+      const s = specs.createDraft({
+        projectId,
+        intakeId,
+        title: "x",
+        body: fullstack().body,
+        provenance: fullstack().provenance,
+      });
+      const body = { ...s.body, acceptanceCriteria: [] };
+      db.prepare(
+        "UPDATE specifications SET body_json = ?, status = 'approved', approved_by = 'x' WHERE id = ?",
+      ).run(JSON.stringify(body), s.id);
+      await expect(propose({ ...s, status: "approved" })).rejects.toThrow(
+        /no work area could be derived/,
+      );
+      expect(db.prepare("SELECT COUNT(*) AS n FROM plans").get()).toEqual({ n: 0 });
+    });
+
+    it("reads a flagged plan stored without findings as flagged with none", async () => {
+      const p = await propose(fullstack());
+      const body = JSON.parse(
+        (db.prepare("SELECT body_json FROM plans WHERE id = ?").get(p.id) as { body_json: string })
+          .body_json,
+      ) as Record<string, unknown>;
+      db.prepare("UPDATE plans SET body_json = ? WHERE id = ?").run(
+        JSON.stringify({ ...body, untrustedInstructionDetected: true }),
+        p.id,
+      );
+      expect(planner.get(p.id)).toMatchObject({
+        untrustedInstructionDetected: true,
+        injectionFindings: [],
+      });
+    });
+  });
 
   describe("propose", () => {
     it("refuses a specification that is not approved", async () => {
@@ -204,6 +248,106 @@ describe("planner", () => {
         acceptanceCriteria: ["AC-2"],
       });
       expect(plan.tasks.find((t) => t.id === "qa")?.dependsOn).toContain("security-review");
+    });
+
+    it("orders implement-frontend after implement-backend when its criteria call the new endpoint (live farewell plan)", async () => {
+      const plan = await propose(approvedSpec(FAREWELL_ACS));
+      const deps = Object.fromEntries(plan.tasks.map((t) => [t.id, t.dependsOn]));
+      expect(deps).toEqual({
+        "implement-backend": [],
+        "implement-frontend": ["implement-backend"],
+        "review-backend": ["implement-backend"],
+        "review-frontend": ["implement-frontend"],
+        docs: ["implement-backend", "implement-frontend", "review-backend", "review-frontend"],
+        qa: [
+          "implement-backend",
+          "implement-frontend",
+          "review-backend",
+          "review-frontend",
+          "docs",
+        ],
+      });
+      expect(planner.dryRun(plan).steps[0]?.tasks.map((t) => t.id)).toEqual(["implement-backend"]);
+      // The model sees the order it fills, and is told when it may add one.
+      const provider = new FakeProvider(filler());
+      await propose(approvedSpec(FAREWELL_ACS), provider);
+      const req = provider.calls[0] as CompleteRequest;
+      expect(req.system).toMatch(/dependsOn \(optional, implementer tasks only\)/);
+      const content = req.messages[0]?.content ?? "";
+      const skeleton = JSON.parse(
+        content.slice(content.indexOf(SKELETON_MARKER) + SKELETON_MARKER.length),
+      ) as { tasks: { id: string; dependsOn: string[] }[] };
+      expect(skeleton.tasks.find((t) => t.id === "implement-frontend")?.dependsOn).toEqual([
+        "implement-backend",
+      ]);
+    });
+
+    it("keeps implementation tasks parallel when neither needs the other (live greet fix)", async () => {
+      const plan = await propose(approvedSpec(GREET_FIX_ACS));
+      const impl = plan.tasks.filter((t) => t.role === "implementer");
+      expect(impl.map((t) => [t.id, t.dependsOn])).toEqual([
+        ["implement-backend", []],
+        ["implement-frontend", []],
+      ]);
+    });
+
+    it("lets the model order one implementer task after another", async () => {
+      const provider = new FakeProvider(
+        filler((tasks) => ({
+          tasks: tasks.map((t) =>
+            t.id === "implement-frontend" ? { ...t, dependsOn: ["implement-backend"] } : t,
+          ),
+        })),
+      );
+      const plan = await propose(fullstack(), provider);
+      expect(plan.tasks.find((t) => t.id === "implement-frontend")?.dependsOn).toEqual([
+        "implement-backend",
+      ]);
+      expect(plan.tasks.find((t) => t.id === "implement-backend")?.dependsOn).toEqual([]);
+      expect(plan.estimates.criticalPathMinutes).toBe(90 + 90 + 30 + 20 + 45);
+      expect(listRuns(db, projectId).at(-1)?.outcome).toBe("ok");
+    });
+
+    it("drops model dependencies outside implementer tasks or that would form a cycle, keeping the rest", async () => {
+      const withDeps = (deps: Record<string, string[]>) =>
+        new FakeProvider(
+          filler((tasks) => ({
+            tasks: tasks.map((t) => (deps[t.id] ? { ...t, dependsOn: deps[t.id] } : t)),
+          })),
+        );
+      const depsOf = (plan: { tasks: PlanTask[] }) =>
+        Object.fromEntries(plan.tasks.map((t) => [t.id, t.dependsOn]));
+      const plain = depsOf(await propose(fullstack()));
+      // The deterministic rule already orders frontend after backend for this spec.
+      const farewell = depsOf(await propose(approvedSpec(FAREWELL_ACS)));
+      expect(
+        depsOf(
+          await propose(
+            approvedSpec(FAREWELL_ACS),
+            withDeps({ "implement-backend": ["implement-frontend"] }),
+          ),
+        ),
+      ).toEqual(farewell);
+      for (const bad of [["review-backend"], ["implement-frontend"], ["nope"]])
+        expect(depsOf(await propose(fullstack(), withDeps({ "implement-frontend": bad })))).toEqual(
+          plain,
+        );
+      expect(depsOf(await propose(fullstack(), withDeps({ qa: ["implement-backend"] })))).toEqual(
+        plain,
+      );
+      // Mutual hints: the first (in skeleton order) is kept, the one closing the cycle dropped.
+      const mutual = depsOf(
+        await propose(
+          fullstack(),
+          withDeps({
+            "implement-backend": ["implement-frontend"],
+            "implement-frontend": ["nope", "implement-backend"],
+          }),
+        ),
+      );
+      expect(mutual["implement-backend"]).toEqual(["implement-frontend"]);
+      expect(mutual["implement-frontend"]).toEqual([]);
+      expect(listRuns(db, projectId).at(-1)?.outcome).toBe("ok");
     });
 
     it("rejects model output that adds or drops tasks, storing nothing", async () => {
@@ -384,6 +528,44 @@ describe("planner", () => {
         approvedBy: "jacob",
         approvedAt: now.toISOString(),
       });
+    });
+
+    it("approves a plan with flagged instructions only when acknowledged, after the state checks", async () => {
+      const plan = await propose(fullstack());
+      db.prepare(
+        "UPDATE plans SET body_json = json_set(body_json, '$.untrustedInstructionDetected', json('true'), '$.injectionFindings', json('[]')) WHERE id = ?",
+      ).run(plan.id);
+      // Still a draft: the state error comes first, not the acknowledgement.
+      expect(() => planner.approve(plan.id, "jacob")).toThrow(PlanStateError);
+      planner.submitForReview(plan.id);
+      expect(() => planner.approve(plan.id, "jacob")).toThrow(PlanUntrustedError);
+      expect(planner.approve(plan.id, "jacob", { acknowledgeUntrusted: true }).status).toBe(
+        "approved",
+      );
+    });
+
+    it("requires the acknowledgement when any version of the lineage was flagged", async () => {
+      const v1 = await propose(fullstack());
+      const v2 = await planner.revise(v1.id, { tasks: v1.tasks }, { harnesses });
+      expect(planner.lineageFlagged(v1.lineageId)).toBe(false);
+      db.prepare(
+        "UPDATE plans SET body_json = json_set(body_json, '$.untrustedInstructionDetected', json('true'), '$.injectionFindings', json('[]')) WHERE id = ?",
+      ).run(v1.id);
+      expect(planner.get(v2.id)?.untrustedInstructionDetected).toBeUndefined();
+      expect(planner.lineageFlagged(v1.lineageId)).toBe(true);
+      planner.submitForReview(v2.id);
+      expect(() => planner.approve(v2.id, "jacob")).toThrow(PlanUntrustedError);
+      expect(planner.approve(v2.id, "jacob", { acknowledgeUntrusted: true }).status).toBe(
+        "approved",
+      );
+    });
+
+    it("refuses to approve a plan whose spec version has since been replaced", async () => {
+      const plan = await propose(fullstack());
+      planner.submitForReview(plan.id);
+      db.prepare("UPDATE specifications SET status = 'superseded' WHERE id = ?").run(plan.specId);
+      expect(() => planner.approve(plan.id, "jacob")).toThrow(/now superseded; propose a plan/);
+      expect(planner.get(plan.id)?.status).toBe("review");
     });
 
     it("revising an approved plan creates a new version needing re-approval; the approved one is immutable", async () => {

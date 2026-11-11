@@ -16,12 +16,18 @@ const Decide = z.strictObject({
   decision: z.enum(["approved", "rejected"]),
   reason: z.string().trim().min(1).max(2000).optional(),
 });
+const Cancel = z.strictObject({ reason: z.string().trim().min(1).max(2000).optional() });
 const Resolve = z.strictObject({
   decision: z.enum(["retry", "skip", "replan", "abort"]),
   reason: z.string().trim().min(1).max(2000),
 });
 
 type IdParams = { Params: { id: string } };
+// Strings only: a repeated parameter arrives as an array.
+const EventsQuery = z.object({
+  follow: z.string().optional(),
+  after: z.string().max(200).optional(),
+});
 
 const HEARTBEAT_MS = 15_000;
 
@@ -98,12 +104,26 @@ export function executionRoutes(
     if (!plan) throw notFound("plan");
     if (plan.status !== "approved")
       throw new ApiError(409, "invalid_state", `plan is ${plan.status}; only approved plans run`);
+    // A plan approved before its spec was replaced would run outdated requirements.
+    const planSpec = s.specs.get(plan.specId);
+    if (planSpec && planSpec.status !== "approved")
+      throw new ApiError(
+        409,
+        "invalid_state",
+        `plan was built from spec v${planSpec.version}, which is now ${planSpec.status}; propose a plan from the approved spec`,
+      );
     const project = s.knowledge.projects.get(plan.projectId);
     if (!project) throw notFound("project");
     const conn = await hub.connection();
     try {
       const mimirProject = await conn.facade.ensureProject(project.repoPath);
-      const execution = await conn.loop.createExecution(plan, { projectId: mimirProject.id });
+      // A plan for a rework spec builds on the delivered change it revises, not the default branch.
+      const spec = s.specs.get(plan.specId);
+      const rework = spec ? s.rework.forLineage(spec.lineageId) : undefined;
+      const execution = await conn.loop.createExecution(plan, {
+        projectId: mimirProject.id,
+        ...(rework ? { baseCommits: rework.baseCommits } : {}),
+      });
       await hub.ensureRunning(execution.id);
       return reply.code(201).send(view(execution.id));
     } catch (err) {
@@ -131,9 +151,10 @@ export function executionRoutes(
     async (req, reply) => {
       const id = req.params.id;
       const execution = requireExecution(id);
-      const follow = req.query.follow !== "0" && req.query.follow !== "false";
+      const query = parseBody(EventsQuery, req.query);
+      const follow = query.follow !== "0" && query.follow !== "false";
       const headerId = req.headers["last-event-id"];
-      const lastId = (Array.isArray(headerId) ? headerId[0] : headerId) ?? req.query.after;
+      const lastId = (Array.isArray(headerId) ? headerId[0] : headerId) ?? query.after;
       let seq = lastId ? eventSeq(s.db, id, lastId) : 0;
 
       reply.hijack();
@@ -177,8 +198,9 @@ export function executionRoutes(
       streams.add(raw);
       const unsubscribe = hub.subscribe((n) => {
         if (n.executionId !== id) return;
-        if (n.type === "event") flush();
-        else write("execution.notice", n);
+        // Rows Sindri writes itself (a cancel, an escalation answer) send no `event` notice.
+        flush();
+        if (n.type !== "event") write("execution.notice", n);
       });
       const ping = setInterval(() => raw.write(": ping\n\n"), HEARTBEAT_MS);
       req.raw.on("close", () => {
@@ -208,13 +230,17 @@ export function executionRoutes(
         // PR approvals arrive after execution streaming has settled. Read them through the
         // SDK, bind them to this mission, and retain the same human approval requirement.
         const execution = hub.reader.get(id)!;
-        const conn = await hub.connection();
-        const remote = await conn.facade.approvalForMission(execution.mimirMissionId, approvalId);
-        if (!remote || remote.action !== "pr.create") throw notFound("approval");
-        if (remote.status !== "pending")
-          throw new ApiError(409, "invalid_state", `approval is already ${remote.status}`);
-        await conn.facade.decideApproval(remote.id, body.decision, body.reason);
-        return { approval: { ...remote, status: body.decision }, execution };
+        try {
+          const conn = await hub.connection();
+          const remote = await conn.facade.approvalForMission(execution.mimirMissionId, approvalId);
+          if (!remote || remote.action !== "pr.create") throw notFound("approval");
+          if (remote.status !== "pending")
+            throw new ApiError(409, "invalid_state", `approval is already ${remote.status}`);
+          await conn.facade.decideApproval(remote.id, body.decision, body.reason);
+          return { approval: { ...remote, status: body.decision }, execution };
+        } catch (err) {
+          throw asMimirUnavailable(err);
+        }
       }
       if (approval.status !== "pending")
         throw new ApiError(409, "invalid_state", `approval is already ${approval.status}`);
@@ -228,6 +254,33 @@ export function executionRoutes(
       return { approval: find(), execution: hub.reader.get(id) };
     },
   );
+
+  /**
+   * Stops a run for good, whatever state it is in (running, waiting for a human, blocked, or
+   * waiting for a replan): cancels the Mimir mission and ends the execution `cancelled`. Like
+   * aborting from an escalation, the bearer token is enough.
+   */
+  app.post<IdParams>("/v1/executions/:id/cancel", async (req) => {
+    const { id } = req.params;
+    const execution = requireExecution(id);
+    const body = parseBody(Cancel, req.body);
+    if (FINAL_STATUSES.has(execution.status))
+      throw new ApiError(
+        409,
+        "invalid_state",
+        `the execution has finished (${execution.status}); there is nothing to cancel`,
+      );
+    req.log.info({ executionId: id }, "execution cancel requested");
+    try {
+      // Runs as the execution's consumer, so the background run stops before the cancel.
+      await hub.takeover(id, ({ loop }) =>
+        loop.cancelExecution(id, { actor: "user", reason: body.reason ?? "cancelled by the user" }),
+      );
+    } catch (err) {
+      throw asMimirUnavailable(err);
+    }
+    return view(id);
+  });
 
   app.post<{ Params: { id: string; planTaskId: string } }>(
     "/v1/executions/:id/escalations/:planTaskId",

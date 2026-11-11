@@ -8,11 +8,39 @@ export interface Project {
   updatedAt?: string;
 }
 
+export interface ProfileCheck {
+  id: string;
+  /** A label for people; not part of the generated harness. */
+  title?: string;
+  /** argv, run without a shell. */
+  command: string[];
+  /** Relative to the repository root. */
+  cwd?: string;
+  timeoutSeconds?: number;
+  /** Default true. */
+  required?: boolean;
+}
+
+/** How a project's repository is checked and what its tools need. Every field is optional. */
+export interface ExecutionProfile {
+  checks?: ProfileCheck[];
+  /** Network policy for the checks. Default `deny`. */
+  network?: "deny" | "allow";
+  env?: Record<string, string>;
+  pathPrepend?: string[];
+  codexSandbox?: { writableRoots?: string[]; networkAccess?: boolean };
+  verificationTimeoutMs?: number;
+}
+
 export interface BootstrapResult {
   indexed: string[];
   unchanged: string[];
   removed: string[];
   skipped: { path: string; reason: string }[];
+  /** Chunks left out of the index because they looked like secrets. */
+  secretsDropped?: { path: string; startLine: number; endLine: number }[];
+  /** Git config keys that were ignored as unsafe while listing files. */
+  unsafeGitConfig?: string[];
 }
 
 export interface SearchHit {
@@ -62,6 +90,9 @@ export interface OpenQuestion {
   id: string;
   text: string;
   blocking: boolean;
+  /** The drafter's suggested answer; advisory. */
+  recommendation?: string;
+  rationale?: string;
 }
 
 export interface SpecBody {
@@ -210,6 +241,8 @@ export interface Settings {
     jira?: { baseUrl: string; email: string; apiTokenSecret: string };
     linear?: { apiKeySecret: string };
   };
+  /** `tokenSecret` names a SecretStore entry; it is never the token itself. */
+  feedbackGraph?: { url: string; tokenSecret: string; enabled: boolean };
 }
 
 export interface Capabilities {

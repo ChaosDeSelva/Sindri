@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ensureDeliverySchema } from "./schema.js";
-import type { SqliteDatabase } from "@sindri/knowledge";
+import { SindriError, type SqliteDatabase } from "@sindri/knowledge";
 import {
   isMimirError,
   type ApprovalDecision,
@@ -82,7 +82,7 @@ export interface ExecutionTask {
   mimirTaskId: string;
   /** Mimir task status, from `task.*` events only. */
   status: string;
-  /** Failed attempts seen so far. */
+  /** Failed attempts seen so far, plus retries a human granted on an escalation. */
   attempts: number;
   lastEventCursor: string | null;
   escalation: Escalation | null;
@@ -185,6 +185,42 @@ export interface VerificationFailureHandler {
 
 const isVerificationFailure = (reason: string) => reason.startsWith("verification_");
 
+/**
+ * Mimir's `blockedReason`s for a task parked on a hard budget: exhausted, or not measurable with
+ * `onUnknown: block`. Only Mimir releases such a task (to `ready`, once the budget has room); its
+ * retry endpoint refuses it.
+ */
+const BUDGET_BLOCKS = ["budget_exceeded", "budget_uncertain"] as const;
+type BudgetBlock = (typeof BUDGET_BLOCKS)[number];
+const budgetBlockOf = (reason: string | null | undefined): BudgetBlock | undefined =>
+  BUDGET_BLOCKS.find((b) => reason === b || reason?.startsWith(`${b}:`));
+
+/** A `budget.exceeded` payload. */
+interface BudgetUse {
+  budgetId: string;
+  unit: string;
+  used: number;
+  limit: number;
+  mimirEventId: string;
+}
+
+/** `blocked_reason` and escalation reason of a task parked on a budget. */
+function budgetReasons(block: BudgetBlock, use: BudgetUse | undefined) {
+  // Unmeasured usage has no numbers; an older `budget.exceeded` would show stale ones.
+  if (block === "budget_uncertain") use = undefined;
+  const blockedReason = use ? `${block}: ${use.unit} ${use.used}/${use.limit}` : block;
+  const what =
+    block === "budget_uncertain"
+      ? "Mimir cannot measure the crew's usage against its hard budget"
+      : use
+        ? `the crew budget is used up (${use.unit} ${use.used} of ${use.limit}, budget ${use.budgetId})`
+        : "the crew budget is used up";
+  return {
+    blockedReason,
+    escalationReason: `${blockedReason}: blocked in Mimir because ${what}. Raise the crew budget in Mimir, then retry; or skip, replan or abort.`,
+  };
+}
+
 interface ExecutionRow {
   id: string;
   plan_id: string;
@@ -272,7 +308,24 @@ export class DeliveryLoop {
    * execution, a new one gets the next run number and therefore a new Mimir mission; it never
    * reattaches to the old mission.
    */
-  async createExecution(plan: Plan, { projectId }: { projectId: string }): Promise<Execution> {
+  async createExecution(
+    plan: Plan,
+    { projectId, baseCommits }: { projectId: string; baseCommits?: readonly string[] },
+  ): Promise<Execution> {
+    // A revised plan is the continuation of a run that asked for a replan: nothing else reads
+    // `replan_requested`, so the older run of this plan lineage ends here.
+    const replanned = this.db
+      .prepare(
+        `SELECT id FROM executions WHERE status = 'replan_requested'
+         AND NOT (plan_id = ? AND plan_version = ?)
+         AND json_valid(plan_json) AND json_extract(plan_json, '$.lineageId') = ?`,
+      )
+      .all(plan.id, plan.version, plan.lineageId) as { id: string }[];
+    for (const old of replanned)
+      await this.cancelExecution(old.id, {
+        actor: "sindri",
+        reason: `superseded by revised plan ${plan.id} (version ${plan.version})`,
+      });
     const existing = this.db
       .prepare(
         `SELECT * FROM executions WHERE plan_id = ? AND plan_version = ?
@@ -289,7 +342,17 @@ export class DeliveryLoop {
           )
           .get(plan.id, plan.version) as { n: number }
       ).n + 1;
-    const submission = await this.mimir.createMissionFromPlan(plan, { projectId, run });
+    const submission = await this.mimir.createMissionFromPlan(plan, {
+      projectId,
+      run,
+      ...(baseCommits?.length ? { baseCommits } : {}),
+    });
+    // Two concurrent requests both pass the check above and get the same mission (the submission
+    // is idempotent); the one that arrives second adopts the execution the first recorded.
+    const raced = this.db
+      .prepare("SELECT * FROM executions WHERE mimir_mission_id = ?")
+      .get(submission.missionId) as ExecutionRow | undefined;
+    if (raced) return toExecution(raced);
     const id = `exe_${randomUUID()}`;
     const at = this.now().toISOString();
     // Token and cost budgets went to Mimir with the crews; wall-clock limits cannot be enforced there.
@@ -347,7 +410,7 @@ export class DeliveryLoop {
         .run(this.now().toISOString(), executionId);
     }
     if (row.status === "pending") this.setStatus(executionId, "running");
-    await this.mimir.start(row.mimir_mission_id);
+    if (!this.missionEnded(executionId)) await this.mimir.start(row.mimir_mission_id);
     return this.consume(executionId, options.signal);
   }
 
@@ -393,6 +456,9 @@ export class DeliveryLoop {
    * - `replan`: turns the escalation into `replan`, emitting `replan_requested`;
    * - `abort`: cancels the Mimir mission and ends the execution `cancelled`.
    * Every decision is recorded as a Sindri `escalation_resolved` event.
+   *
+   * Once Mimir has failed the mission no task can run again: `retry` is refused
+   * (`invalid_state`), `skip` finishes with what is verified, `replan` and `abort` work as usual.
    */
   async resolveEscalation(
     executionId: string,
@@ -410,14 +476,45 @@ export class DeliveryLoop {
     const { decision, actor, reason } = input;
     const at = this.now().toISOString();
 
-    if (decision === "retry") {
+    // Mimir fails the mission right after the task that exhausted its attempts, usually once the
+    // loop has stopped reading on the escalation. A retry therefore looks at the unread events
+    // first (without handling them: the next run does) instead of asking for a doomed attempt.
+    const unread =
+      decision === "retry" && !this.missionEnded(executionId)
+        ? (
+            await this.mimir.catchUp(
+              row.mimir_mission_id,
+              input.signal ? { signal: input.signal } : {},
+            )
+          ).events
+        : [];
+    const ended = this.missionEnded(executionId) || unread.some((e) => e.type === "mission.failed");
+    if (decision === "retry" && ended)
+      throw new SindriError(
+        "invalid_state",
+        "the Mimir mission has ended, so this task cannot be retried; skip it, request a replan or abort, then run the plan again",
+      );
+    // A task parked on its budget is not retried in Mimir: Mimir itself returns it to `ready` once
+    // the operator has raised the budget there. Retry continues the run after that has happened.
+    const budgetBlock = task.status === "blocked" ? budgetBlockOf(task.blocked_reason) : undefined;
+    if (decision === "retry" && budgetBlock) {
+      const released = unread.some((e) => {
+        const to = (e.payload as { to?: unknown }).to;
+        return e.taskId === task.mimir_task_id && typeof to === "string" && to !== "blocked";
+      });
+      if (!released)
+        throw new SindriError(
+          "invalid_state",
+          `Mimir still holds ${planTaskId} on its budget (${task.blocked_reason}). Raise the crew budget in Mimir first; once Mimir returns the task to ready, retry continues the run. Or skip, replan or abort.`,
+        );
+    } else if (decision === "retry") {
       await this.mimir.retry(task.mimir_task_id, {
         attempt: task.attempts + 1,
         reason: `human retry by ${actor}: ${reason}`,
       });
     }
-    if (decision === "abort") {
-      await this.mimir.cancel(row.mimir_mission_id, `aborted by ${actor}: ${reason}`);
+    if (decision === "abort" && !ended) {
+      await this.cancelMission(row.mimir_mission_id, `aborted by ${actor}: ${reason}`);
     }
 
     const notices: DeliveryNotice[] = [];
@@ -437,12 +534,15 @@ export class DeliveryLoop {
         .run(at, executionId, planTaskId);
       switch (decision) {
         case "retry":
+          // The human's attempt number is spent: a later automatic retry (here or by the gate
+          // runner) must not reuse its `sindri:retry:<task>:<attempt>` key. A budget release
+          // asks Mimir for no attempt, so it spends none.
           this.db
             .prepare(
               `UPDATE execution_tasks SET escalation = NULL, escalation_reason = NULL,
-                 blocked_reason = NULL WHERE id = ?`,
+                 blocked_reason = NULL, attempts = ? WHERE id = ?`,
             )
-            .run(task.id);
+            .run(budgetBlock ? task.attempts : task.attempts + 1, task.id);
           this.setStatusIn(executionId, "running", notices);
           break;
         case "skip": {
@@ -481,10 +581,7 @@ export class DeliveryLoop {
           this.setStatusIn(executionId, "replan_requested", notices);
           break;
         case "abort":
-          this.db
-            .prepare("UPDATE executions SET finished_at = ? WHERE id = ?")
-            .run(at, executionId);
-          this.setStatusIn(executionId, "cancelled", notices);
+          this.finish(executionId, "cancelled", notices);
           break;
       }
     })();
@@ -493,6 +590,35 @@ export class DeliveryLoop {
       return { status: this.row(executionId).status, interrupted: false };
     }
     return this.resume(executionId, input.signal ? { signal: input.signal } : {});
+  }
+
+  /**
+   * Stops a run for good: cancels the Mimir mission (a mission that already ended counts as
+   * stopped) and ends the execution `cancelled`, recording who asked and why as a Sindri
+   * `execution_cancelled` event. Open inbox items and pending approvals are closed with it. A
+   * finished execution is returned unchanged.
+   */
+  async cancelExecution(
+    executionId: string,
+    { actor, reason }: { actor: string; reason: string },
+  ): Promise<Execution> {
+    const row = this.row(executionId);
+    if (FINAL.includes(row.status)) return toExecution(row);
+    if (!this.missionEnded(executionId))
+      await this.cancelMission(row.mimir_mission_id, `cancelled by ${actor}: ${reason}`);
+    const notices: DeliveryNotice[] = [];
+    this.db.transaction(() => {
+      // The run may have ended while Mimir was being asked.
+      if (FINAL.includes(this.row(executionId).status)) return;
+      this.recordSindriEvent(executionId, "execution_cancelled", {
+        actor,
+        reason,
+        previousStatus: row.status,
+      });
+      this.finish(executionId, "cancelled", notices);
+    })();
+    for (const n of notices) this.notify(n);
+    return this.get(executionId) as Execution;
   }
 
   /** Open and resolved inbox items that are not Mimir approvals (see `approvals`). */
@@ -774,6 +900,8 @@ export class DeliveryLoop {
       const to = (event.payload as { to?: string }).to;
       if (to)
         this.db.prepare("UPDATE execution_tasks SET status = ? WHERE id = ?").run(to, task.id);
+      if (to && to !== "blocked" && budgetBlockOf(task.blocked_reason))
+        this.budgetReleased(executionId, task, notices);
     }
     if (task && decision.retry) {
       this.db
@@ -862,33 +990,50 @@ export class DeliveryLoop {
       case "mission.cancelled": {
         // A cancel Sindri itself sent after skipping/aborting arrives after the execution ended.
         if (FINAL.includes(this.row(executionId).status)) break;
-        this.setStatusIn(executionId, "cancelled", notices);
-        this.db.prepare("UPDATE executions SET finished_at = ? WHERE id = ?").run(at, executionId);
+        // Cancelled in Mimir: nobody can act on its approvals or inbox items any more.
+        this.finish(executionId, "cancelled", notices);
+        break;
+      }
+      // `mission.failed` is acted on in `settle`: Mimir emits it exactly when a task is escalated
+      // to a human, whose skip/replan/abort must still work, so the stored event is the record.
+      // Mimir parks a ready task whose crew budget is used up (`task.blocked`, reason
+      // `budget_exceeded`) and reports the budget itself (`budget.exceeded`, crew-scoped, no task)
+      // in either order. Each parked task becomes an `ask` escalation, whatever the plan's
+      // escalation, since only a human can raise a budget; it carries the numbers once known.
+      case "task.blocked": {
+        const block = budgetBlockOf(event.payload.reason);
+        if (!task || !block) break;
+        const crewId = event.crewId ?? null;
+        const use =
+          crewId && block === "budget_exceeded"
+            ? this.crewBudgetUse(executionId, crewId)
+            : undefined;
+        this.escalateBudget(executionId, task.id, block, crewId, use, notices);
         break;
       }
       case "budget.exceeded": {
         const { unit, used, limit, budgetId } = event.payload;
-        const blockedReason = `budget_exceeded: ${unit} ${used}/${limit}`;
+        const use: BudgetUse = { budgetId, unit, used, limit, mimirEventId: event.id };
         if (task) {
           this.db
-            .prepare(
-              `UPDATE execution_tasks SET status = 'blocked', blocked_reason = ?,
-                 escalation = COALESCE(escalation, 'ask'),
-                 escalation_reason = COALESCE(escalation_reason, ?) WHERE id = ?`,
-            )
-            .run(blockedReason, blockedReason, task.id);
-          notices.push({
-            type: "escalated",
-            executionId,
-            planTaskId: task.plan_task_id,
-            escalation: "ask",
-            reason: blockedReason,
-          });
+            .prepare("UPDATE execution_tasks SET status = 'blocked' WHERE id = ?")
+            .run(task.id);
+          this.escalateBudget(executionId, task.id, "budget_exceeded", null, use, notices);
+          break;
         }
+        const crewId = event.crewId ?? this.crewOfBudget(executionId, budgetId);
+        if (crewId) {
+          // Tasks already parked on this crew's budget learn the numbers; tasks parked later look
+          // them up. A crew whose tasks are all done has nothing for a human to decide.
+          for (const { id, block } of this.budgetEscalations(executionId, crewId))
+            this.escalateBudget(executionId, id, block, crewId, use, notices);
+          break;
+        }
+        // A budget Sindri cannot attribute to a crew (for example a mission budget).
         this.openInbox(
           executionId,
           "budget_exceeded",
-          task?.plan_task_id ?? null,
+          null,
           { budgetId, unit, used, limit, mimirEventId: event.id },
           notices,
         );
@@ -905,6 +1050,162 @@ export class DeliveryLoop {
     ) {
       this.setStatusIn(executionId, "running", notices);
     }
+  }
+
+  /**
+   * Escalates a task parked on its budget (`ask`) with an open `budget_exceeded` inbox item, or
+   * updates both once the budget's numbers arrive. Call inside a transaction.
+   */
+  private escalateBudget(
+    executionId: string,
+    taskRowId: string,
+    block: BudgetBlock,
+    crewId: string | null,
+    use: BudgetUse | undefined,
+    notices: DeliveryNotice[],
+  ): void {
+    const task = this.db.prepare("SELECT * FROM execution_tasks WHERE id = ?").get(taskRowId) as
+      TaskRow | undefined;
+    if (!task) return;
+    const { blockedReason, escalationReason } = budgetReasons(block, use);
+    this.db
+      .prepare(
+        `UPDATE execution_tasks SET blocked_reason = ?, escalation = 'ask', escalation_reason = ?
+         WHERE id = ?`,
+      )
+      .run(blockedReason, escalationReason, task.id);
+    if (task.escalation !== "ask" || task.escalation_reason !== escalationReason)
+      notices.push({
+        type: "escalated",
+        executionId,
+        planTaskId: task.plan_task_id,
+        escalation: "ask",
+        reason: escalationReason,
+      });
+    const open = this.db
+      .prepare(
+        `SELECT id, detail_json FROM execution_inbox WHERE execution_id = ? AND plan_task_id = ?
+         AND kind = 'budget_exceeded' AND status = 'open' ORDER BY rowid LIMIT 1`,
+      )
+      .get(executionId, task.plan_task_id) as { id: string; detail_json: string } | undefined;
+    const before = open ? (JSON.parse(open.detail_json) as { crewId?: string | null }) : {};
+    const detail = {
+      reason: block,
+      crewId: crewId ?? before.crewId ?? null,
+      ...(block === "budget_exceeded" ? (use ?? {}) : {}),
+      escalationReason,
+    };
+    if (open)
+      this.db
+        .prepare("UPDATE execution_inbox SET detail_json = ? WHERE id = ?")
+        .run(JSON.stringify(detail), open.id);
+    else this.openInbox(executionId, "budget_exceeded", task.plan_task_id, detail, notices);
+  }
+
+  /**
+   * Mimir released a task parked on its budget (the operator raised the budget in Mimir): its
+   * budget escalation is answered, as if a human had retried it. Call inside a transaction.
+   */
+  private budgetReleased(executionId: string, task: TaskRow, notices: DeliveryNotice[]): void {
+    this.db.prepare("UPDATE execution_tasks SET blocked_reason = NULL WHERE id = ?").run(task.id);
+    if (task.escalation !== "ask" || !budgetBlockOf(task.escalation_reason)) return;
+    this.recordSindriEvent(executionId, "escalation_resolved", {
+      planTaskId: task.plan_task_id,
+      decision: "retry",
+      actor: "mimir",
+      reason: "Mimir released the task: its budget has room again",
+      previous: { escalation: task.escalation, reason: task.escalation_reason },
+    });
+    this.db
+      .prepare(
+        "UPDATE execution_tasks SET escalation = NULL, escalation_reason = NULL WHERE id = ?",
+      )
+      .run(task.id);
+    this.db
+      .prepare(
+        `UPDATE execution_inbox SET status = 'resolved', resolved_at = ?
+         WHERE execution_id = ? AND plan_task_id = ? AND kind = 'budget_exceeded' AND status = 'open'`,
+      )
+      .run(this.now().toISOString(), executionId, task.plan_task_id);
+    if (
+      this.row(executionId).status === "awaiting_human" &&
+      this.pendingApprovals(executionId) === 0 &&
+      this.openInboxItems(executionId) === 0 &&
+      !this.hasEscalation(executionId, "ask")
+    )
+      this.setStatusIn(executionId, "running", notices);
+  }
+
+  /** The Mimir crew a crew budget belongs to, from the stored `crew.created` events. */
+  private crewOfBudget(executionId: string, budgetId: string): string | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT json_extract(payload_json, '$.crew.id') AS crew FROM execution_events
+         WHERE execution_id = ? AND type = 'crew.created'
+         AND json_extract(payload_json, '$.budget.id') = ?`,
+      )
+      .get(executionId, budgetId) as { crew: string | null } | undefined;
+    return row?.crew ?? undefined;
+  }
+
+  /**
+   * The latest `budget.exceeded` for the crew's budget at its current version (raised by
+   * `budget.updated`), if any: one measured against an older limit is stale.
+   */
+  private crewBudgetUse(executionId: string, crewId: string): BudgetUse | undefined {
+    const crew = this.db
+      .prepare(
+        `SELECT json_extract(payload_json, '$.budget.id') AS id,
+           json_extract(payload_json, '$.budget.version') AS version FROM execution_events
+         WHERE execution_id = ? AND type = 'crew.created' AND json_extract(payload_json, '$.crew.id') = ?`,
+      )
+      .get(executionId, crewId) as { id: string | null; version: number | null } | undefined;
+    if (!crew?.id) return undefined;
+    const updated = this.db
+      .prepare(
+        `SELECT json_extract(payload_json, '$.budget.version') AS version FROM execution_events
+         WHERE execution_id = ? AND type = 'budget.updated' AND json_extract(payload_json, '$.budget.id') = ?
+         ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(executionId, crew.id) as { version: number | null } | undefined;
+    const version = updated?.version ?? crew.version ?? 0;
+    const row = this.db
+      .prepare(
+        `SELECT mimir_event_id, payload_json FROM execution_events
+         WHERE execution_id = ? AND type = 'budget.exceeded' AND json_extract(payload_json, '$.budgetId') = ?
+         AND COALESCE(json_extract(payload_json, '$.budgetVersion'), 0) = ?
+         ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(executionId, crew.id, version) as
+      { mimir_event_id: string; payload_json: string } | undefined;
+    if (!row) return undefined;
+    const p = JSON.parse(row.payload_json) as Omit<BudgetUse, "mimirEventId">;
+    return {
+      budgetId: p.budgetId,
+      unit: p.unit,
+      used: p.used,
+      limit: p.limit,
+      mimirEventId: row.mimir_event_id,
+    };
+  }
+
+  /** Execution task ids with an open budget escalation on the crew's budget. */
+  private budgetEscalations(
+    executionId: string,
+    crewId: string,
+  ): { id: string; block: BudgetBlock }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT t.id, t.blocked_reason FROM execution_inbox i
+         JOIN execution_tasks t ON t.execution_id = i.execution_id AND t.plan_task_id = i.plan_task_id
+         WHERE i.execution_id = ? AND i.kind = 'budget_exceeded' AND i.status = 'open'
+         AND json_extract(i.detail_json, '$.crewId') = ? AND t.escalation = 'ask'`,
+      )
+      .all(executionId, crewId) as { id: string; blocked_reason: string | null }[];
+    return rows.flatMap((r) => {
+      const block = budgetBlockOf(r.blocked_reason);
+      return block ? [{ id: r.id, block }] : [];
+    });
   }
 
   private openInbox(
@@ -971,13 +1272,30 @@ export class DeliveryLoop {
       .get(executionId);
     if (completed) {
       await this.collectArtifacts(executionId);
-      this.db
-        .prepare("UPDATE executions SET finished_at = ? WHERE id = ?")
-        .run(this.now().toISOString(), executionId);
-      this.setStatus(executionId, "verified_pending_review");
+      this.end(executionId, "verified_pending_review");
       return "verified_pending_review";
     }
     const tasks = this.tasks(executionId);
+    if (this.missionEnded(executionId)) {
+      // Mimir gave up on the mission: no task will run again. While a human still has an
+      // escalation to answer (or a replan is pending) the execution waits for them.
+      if (row.status === "replan_requested") return row.status;
+      if (tasks.some((t) => t.escalation)) {
+        const waiting = this.waitingStatus(executionId, tasks);
+        this.setStatus(executionId, waiting);
+        return waiting;
+      }
+      // Everything unfinished was skipped by a human: deliver the verified part, if there is
+      // one. With nothing completed there is nothing to review or export, so the run failed.
+      const skipped =
+        tasks.some((t) => t.resolution) &&
+        tasks.some((t) => t.status === "completed") &&
+        tasks.every((t) => t.status === "completed" || t.resolution);
+      if (skipped) await this.collectArtifacts(executionId);
+      const status: ExecutionStatus = skipped ? "verified_pending_review" : "failed";
+      this.end(executionId, status);
+      return status;
+    }
     const byPlanId = new Map(tasks.map((t) => [t.planTaskId, t]));
     const pendingApprovalTasks = new Set(
       this.approvals(executionId)
@@ -1005,27 +1323,72 @@ export class DeliveryLoop {
     if (open.length === 0) {
       if (!tasks.some((t) => t.resolution)) return null; // all completed: wait for mission.completed
       // Everything left was skipped by a human: Mimir can never complete this mission.
-      await this.mimir.cancel(row.mimir_mission_id, "remaining tasks skipped by a human in Sindri");
+      await this.cancelMission(
+        row.mimir_mission_id,
+        "remaining tasks skipped by a human in Sindri",
+      );
       await this.collectArtifacts(executionId);
-      this.db
-        .prepare("UPDATE executions SET finished_at = ? WHERE id = ?")
-        .run(this.now().toISOString(), executionId);
-      this.setStatus(executionId, "verified_pending_review");
+      this.end(executionId, "verified_pending_review");
       return "verified_pending_review";
     }
     if (!open.every((t) => isStuck(t.planTaskId))) return null;
+    const status = this.waitingStatus(executionId, tasks);
+    this.setStatus(executionId, status);
+    return status;
+  }
+
+  /** Ends the execution in one transaction, then sends its notices. Every ending goes through here
+   * so each one closes what nobody can act on any more. */
+  private end(executionId: string, status: ExecutionStatus): void {
+    const notices: DeliveryNotice[] = [];
+    this.db.transaction(() => this.finish(executionId, status, notices))();
+    for (const n of notices) this.notify(n);
+  }
+
+  /** The status of an execution in which nothing can progress without a human. */
+  private waitingStatus(executionId: string, tasks: ExecutionTask[]): ExecutionStatus {
     const escalations = tasks.map((t) => t.escalation).filter(Boolean);
-    let status: ExecutionStatus;
-    if (escalations.includes("replan")) status = "replan_requested";
-    else if (
+    if (escalations.includes("replan")) return "replan_requested";
+    if (
       escalations.includes("ask") ||
       this.pendingApprovals(executionId) > 0 ||
       this.openInboxItems(executionId) > 0
-    ) {
-      status = "awaiting_human";
-    } else status = "blocked";
-    this.setStatus(executionId, status);
-    return status;
+    )
+      return "awaiting_human";
+    return "blocked";
+  }
+
+  /** True once Mimir has failed the mission: nothing runs again and a cancel is unnecessary. */
+  private missionEnded(executionId: string): boolean {
+    return (
+      this.db
+        .prepare(
+          "SELECT 1 FROM execution_events WHERE execution_id = ? AND type = 'mission.failed'",
+        )
+        .get(executionId) !== undefined
+    );
+  }
+
+  /**
+   * Ends the execution: closes open inbox items, expires pending approvals (nobody can act on
+   * them any more) and sets the final status. Call inside a transaction.
+   */
+  private finish(executionId: string, status: ExecutionStatus, notices: DeliveryNotice[]): void {
+    const at = this.now().toISOString();
+    this.db
+      .prepare(
+        `UPDATE execution_inbox SET status = 'resolved', resolved_at = ?
+         WHERE execution_id = ? AND status = 'open'`,
+      )
+      .run(at, executionId);
+    this.db
+      .prepare(
+        `UPDATE execution_approvals SET status = 'expired'
+         WHERE execution_id = ? AND status = 'pending'`,
+      )
+      .run(executionId);
+    this.db.prepare("UPDATE executions SET finished_at = ? WHERE id = ?").run(at, executionId);
+    this.setStatusIn(executionId, status, notices);
   }
 
   /**
@@ -1038,6 +1401,19 @@ export class DeliveryLoop {
       this.db
         .prepare("UPDATE artifacts_refs SET sha256 = ?, uri = ?, kind = ? WHERE id = ?")
         .run(artifact.hash, artifact.uri, artifact.kind, ref.id);
+    }
+  }
+
+  /**
+   * Cancels a mission, treating `invalid_transition` as done: Mimir only cancels draft, active
+   * and paused missions, so that answer means the mission already completed, failed or was
+   * cancelled.
+   */
+  private async cancelMission(missionId: string, reason: string): Promise<void> {
+    try {
+      await this.mimir.cancel(missionId, reason);
+    } catch (err) {
+      if (!isMimirError(err) || err.code !== "invalid_transition") throw err;
     }
   }
 

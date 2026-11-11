@@ -118,12 +118,15 @@ export function deriveWorkAreas(spec: AreaInput, repoIndex: RepoIndex = {}): Wor
   };
 
   const unmatched: string[] = [];
+  /** Criteria that mention something other than documentation: someone has to build them. */
+  const toBuild: string[] = [];
   for (const c of spec.acceptanceCriteria) {
     let hit = false;
     for (const kind of AREA_KINDS) {
       const word = keywordHit(kind, c.text);
       if (!word) continue;
       hit = true;
+      if (kind !== "docs" && !toBuild.includes(c.id)) toBuild.push(c.id);
       const a = area(kind);
       a.acceptanceCriteria.push(c.id);
       a.reasons.push(`${c.id} mentions "${word}"`);
@@ -162,5 +165,90 @@ export function deriveWorkAreas(spec: AreaInput, repoIndex: RepoIndex = {}): Wor
     }
   }
 
+  // Security and docs areas only review and document, so every criterion that asks for more than
+  // documentation needs an implementer too, also when other criteria already have one. It goes
+  // where the repository says the work is, else to backend.
+  const uncovered = toBuild.filter(
+    (id) => !IMPLEMENTATION.some((k) => areas.get(k)?.acceptanceCriteria.includes(id)),
+  );
+  if (uncovered.length > 0) {
+    const pathImpl = IMPLEMENTATION.filter((k) => fromPaths.has(k));
+    for (const kind of pathImpl.length > 0 ? pathImpl : (["backend"] as AreaKind[])) {
+      const a = area(kind);
+      for (const id of uncovered) {
+        a.acceptanceCriteria.push(id);
+        a.reasons.push(`${id} matches no implementation area; assigned to ${kind}`);
+      }
+    }
+  }
+
   return AREA_KINDS.filter((k) => areas.has(k)).map((k) => area(k));
+}
+
+/**
+ * URL paths a criterion text mentions (`GET /api/greeter/farewell?name=Ada` gives
+ * `/api/greeter/farewell`), lower-cased without query or trailing slash. A path must start the
+ * word, so repository file paths (`services/greeter/server.mjs`), full URLs
+ * (`http://127.0.0.1:5100`) and query values (`?next=/health`) do not count, nor does a path whose
+ * last segment has a file extension.
+ */
+export function urlPaths(text: string): string[] {
+  const found = new Set<string>();
+  for (const m of text.matchAll(/(?:^|[\s"'`(])((?:\/[A-Za-z0-9_\-{}:.~%]+)+)\/?/g)) {
+    const segments = (m[1] as string).toLowerCase().split("/").slice(1);
+    const last = segments.at(-1) as string;
+    if (segments.some((s) => /^\.+$/.test(s)) || /\.[a-z][a-z0-9]*$/.test(last)) continue;
+    found.add(`/${segments.join("/")}`);
+  }
+  return [...found];
+}
+
+/**
+ * True when `caller` is `endpoint` or reaches it through a prefix, the way a UI gateway forwards
+ * `/api/greeter/farewell` to the greeter's `/farewell`. Both start with `/`, so the match is on
+ * whole segments.
+ */
+const reaches = (caller: string, endpoint: string) => caller.endsWith(endpoint);
+
+/** Probe endpoints most services have: naming one says nothing about which task adds it. */
+const GENERIC_ENDPOINTS = new Set(["/health", "/healthz", "/status", "/ready", "/metrics"]);
+
+export interface ImplementationDependency {
+  /** The implementation area whose task waits. */
+  area: AreaKind;
+  dependsOn: AreaKind;
+  reasons: string[];
+}
+
+/**
+ * Deterministic order between the implementation areas: the frontend task builds on the backend
+ * task when a frontend criterion calls a URL path that another, backend criterion of the same spec
+ * names (the backend adds or changes that endpoint, and the frontend's own checks exercise it).
+ * Without such a path both run in parallel from the same base; the plan model may still order
+ * them.
+ */
+export function implementationDependencies(
+  spec: AreaInput,
+  areas: readonly WorkArea[],
+): ImplementationDependency[] {
+  const backend = areas.find((a) => a.kind === "backend");
+  const frontend = areas.find((a) => a.kind === "frontend");
+  if (!backend || !frontend) return [];
+  const pathsOf = (ids: readonly string[]) =>
+    spec.acceptanceCriteria
+      .filter((c) => ids.includes(c.id))
+      .flatMap((c) => urlPaths(c.text).map((path) => ({ id: c.id, path })));
+  const endpoints = pathsOf(backend.acceptanceCriteria).filter(
+    (e) => !GENERIC_ENDPOINTS.has(e.path),
+  );
+  const reasons: string[] = [];
+  for (const call of pathsOf(frontend.acceptanceCriteria)) {
+    // A criterion in both areas does not count as its own backend: it would always match.
+    const hit = endpoints.find((e) => e.id !== call.id && reaches(call.path, e.path));
+    if (hit)
+      reasons.push(
+        `${call.id} (frontend) calls ${call.path}, which ${hit.id} (backend) names as ${hit.path}`,
+      );
+  }
+  return reasons.length > 0 ? [{ area: "frontend", dependsOn: "backend", reasons }] : [];
 }

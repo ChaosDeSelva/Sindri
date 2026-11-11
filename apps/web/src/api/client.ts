@@ -4,10 +4,19 @@ export interface KnowledgeProposal {
   status: "proposed" | "accepted" | "rejected";
   sourceRefs: { taskEvidenceId: string }[];
 }
+/** An earlier change request on a delivery, with the spec versions drafted for it. */
+export interface ReworkSummary {
+  id: string;
+  feedback: string;
+  createdAt: string;
+  baseCommits: string[];
+  specs: { id: string; version: number; status: string; title: string }[];
+}
 import type {
   BootstrapResult,
   Capabilities,
   DraftResult,
+  ExecutionProfile,
   Intake,
   IntakeComment,
   KnowledgeEntry,
@@ -22,6 +31,7 @@ import type {
   SpecMeta,
 } from "./types.js";
 import { deliveryMethods } from "./delivery-client.js";
+import { stewardMethods } from "./steward-client.js";
 
 /** An API failure carrying the server's `{ error: { code, message } }` envelope. */
 export class ApiError extends Error {
@@ -46,12 +56,21 @@ export interface ClientOptions {
 
 const enc = encodeURIComponent;
 
+/** Where the operator is asking from; the Guide scopes its state snapshot to the project. */
+export interface GuideContext {
+  app: "sindri";
+  screen?: string;
+  projectId?: string;
+}
+
 /**
- * Routes that need the approval secret: spec and plan approval, PR requests (audit M9) and
- * decisions on agents' gated actions (review I1).
+ * Routes that need the approval secret: spec and plan approval, PR requests (audit M9),
+ * decisions on agents' gated actions (review I1), a project's execution profile and the
+ * steward's per-type modes. Accepting a steward decision is gated only for approval types, which
+ * the path cannot tell, so those calls pass `approval: true` instead.
  */
 const APPROVAL_ROUTE =
-  /^\/v1\/(?:(?:specs|plans)\/[^/]+\/approve|executions\/[^/]+\/(?:pr|approvals\/[^/]+)|projects\/[^/]+\/data|deliveries\/[^/]+\/proposals(?:\/[^/]+\/decision)?)$/;
+  /^\/v1\/(?:(?:specs|plans)\/[^/]+\/approve|executions\/[^/]+\/(?:pr|approvals\/[^/]+)|projects\/[^/]+\/(?:data|profile)|deliveries\/[^/]+\/proposals(?:\/[^/]+\/decision)?|steward\/modes)$/;
 const APPROVAL_HEADER = "x-sindri-approval";
 const qs = (params: Record<string, string>) => new URLSearchParams(params).toString();
 
@@ -63,11 +82,19 @@ export function createApiClient(opts: ClientOptions) {
   // store, so it is gone when the tab closes (audit M9).
   let approvalSecret: string | null = null;
 
-  async function send(method: string, path: string, body?: unknown): Promise<Response> {
+  async function send(
+    method: string,
+    path: string,
+    body?: unknown,
+    o: { approval?: boolean } = {},
+  ): Promise<Response> {
     const headers = new Headers();
     const token = opts.getToken();
     if (token) headers.set("authorization", `Bearer ${token}`);
-    const approvalRoute = APPROVAL_ROUTE.test(path.split("?")[0] ?? "");
+    const route = path.split("?")[0] ?? "";
+    // No read is gated (a profile and a delivery's proposals are read on gated paths), so a GET
+    // never carries the secret.
+    const approvalRoute = method !== "GET" && (o.approval === true || APPROVAL_ROUTE.test(route));
     if (approvalRoute && approvalSecret) headers.set(APPROVAL_HEADER, approvalSecret);
     const init: RequestInit = { method, headers };
     if (method !== "GET") {
@@ -100,8 +127,12 @@ export function createApiClient(opts: ClientOptions) {
     }
     return res;
   }
-  const call = async <T>(method: string, path: string, body?: unknown): Promise<T> =>
-    (await (await send(method, path, body)).json()) as T;
+  const call = async <T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    o?: { approval?: boolean },
+  ): Promise<T> => (await (await send(method, path, body, o)).json()) as T;
 
   return {
     listProposals: async (id: string) =>
@@ -116,7 +147,64 @@ export function createApiClient(opts: ClientOptions) {
       ).proposals,
     decideProposal: (id: string, proposalId: string, decision: "accepted" | "rejected") =>
       call("POST", `/v1/deliveries/${enc(id)}/proposals/${enc(proposalId)}/decision`, { decision }),
+    /** Reviewer feedback on a delivery; returns the specification drafted for the rework. */
+    requestRework: (id: string, feedback: string) =>
+      call<{ rework: { id: string }; spec: Spec }>("POST", `/v1/deliveries/${enc(id)}/rework`, {
+        feedback,
+      }),
+    listReworks: async (id: string) =>
+      (await call<{ reworks: ReworkSummary[] }>("GET", `/v1/deliveries/${enc(id)}/reworks`))
+        .reworks,
     health: () => call<{ status: string }>("GET", "/v1/health"),
+    /**
+     * Reads `/v1/changes` until it ends or `signal` aborts, calling `onChange` with the server's
+     * change version on connect and after every write. Read with fetch so the token stays in a
+     * header. Resolves when the server closes the stream; throws if it cannot be opened.
+     */
+    async streamChanges(onChange: (version: number) => void, signal: AbortSignal): Promise<void> {
+      const res = await send("GET", "/v1/changes");
+      const reader = res.body?.getReader();
+      if (!reader) return;
+      if (signal.aborted) {
+        await reader.cancel().catch(() => undefined);
+        return;
+      }
+      const onAbort = () => void reader.cancel().catch(() => undefined);
+      signal.addEventListener("abort", onAbort, { once: true });
+      const dec = new TextDecoder();
+      let buf = "";
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+          let i: number;
+          while ((i = buf.indexOf("\n\n")) !== -1) {
+            const frame = buf.slice(0, i);
+            buf = buf.slice(i + 2);
+            const data = /^data: ?(.*)$/m.exec(frame)?.[1];
+            if (!/^event: ?changed$/m.test(frame) || !data || signal.aborted) continue;
+            try {
+              const version = (JSON.parse(data) as { version?: unknown }).version;
+              if (typeof version === "number") onChange(version);
+            } catch {
+              /* a malformed frame is skipped; the next one carries the current version */
+            }
+          }
+        }
+      } catch (err) {
+        if (!signal.aborted) throw err;
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+      }
+    },
+    /** The read-only Guide (docs + a redacted state snapshot); it never acts. */
+    askGuide: (question: string, context: GuideContext) =>
+      call<{ answer: string; links: { label: string; href: string }[]; sources: string[] }>(
+        "POST",
+        "/v1/guide/ask",
+        { question, context },
+      ),
     capabilities: () => call<Capabilities>("GET", "/v1/capabilities"),
 
     listProjects: async () => (await call<{ projects: Project[] }>("GET", "/v1/projects")).projects,
@@ -129,6 +217,15 @@ export function createApiClient(opts: ClientOptions) {
     search: async (id: string, q: string) =>
       (await call<{ hits: SearchHit[] }>("GET", `/v1/projects/${enc(id)}/search?${qs({ q })}`))
         .hits,
+    getProfile: async (id: string) =>
+      (await call<{ profile: ExecutionProfile }>("GET", `/v1/projects/${enc(id)}/profile`)).profile,
+    /** Replaces the whole profile. `harness` is null when the profile has no checks. */
+    putProfile: (id: string, profile: ExecutionProfile) =>
+      call<{ profile: ExecutionProfile; harness: { name: string; version: string } | null }>(
+        "PUT",
+        `/v1/projects/${enc(id)}/profile`,
+        profile,
+      ),
     /** `eraseEvidence` also erases immutable task evidence (ids and hashes are kept). */
     deleteProjectData: (id: string, confirm: string, o: { eraseEvidence?: boolean } = {}) =>
       call<{ deleted: { projectId: string; evidenceErased?: number } }>(
@@ -177,6 +274,10 @@ export function createApiClient(opts: ClientOptions) {
       return { principal: session.principal, expiresAt: session.expiresAt };
     },
     hasApprovalSession: () => approvalSecret !== null,
+    /** Sign-out and a rejected token end the approval session too. */
+    forgetApproval: () => {
+      approvalSecret = null;
+    },
     /** The approver is the server-side approval principal; flagged specs need acknowledgement. */
     approveSpec: async (id: string, opts: { acknowledgeUntrusted?: boolean } = {}) =>
       (
@@ -218,6 +319,7 @@ export function createApiClient(opts: ClientOptions) {
       (await call<{ settings: Settings }>("PUT", "/v1/settings", settings)).settings,
     exportData: async () => (await send("GET", "/v1/export")).blob(),
     ...deliveryMethods(call, send),
+    ...stewardMethods(call),
   };
 }
 

@@ -38,6 +38,9 @@ export interface Plan {
     tokens: number;
     costUsd: number | null;
   };
+  /** Set when the lessons or repository text the plan was built from held injected instructions. */
+  untrustedInstructionDetected?: boolean;
+  injectionFindings?: { source: string; patternId: string }[];
   approvedBy: string | null;
   approvedAt: string | null;
   createdAt: string;
@@ -297,10 +300,13 @@ export interface DeliveryDetail {
 export interface LocalDelivery {
   baseSha: string;
   resultCommit: string;
+  /** The whole change, byte for byte as it must be applied. */
   patch: string;
   repoPath: string;
   apply: string;
   undo: string;
+  /** For a rework: only what changed since the earlier delivery's result (`baseSha`). */
+  followUp?: { baseSha: string; patch: string };
 }
 
 interface TraceEvent {

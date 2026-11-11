@@ -62,4 +62,9 @@ describe("secret scanning (review Ssec I2, m2, m3)", () => {
     expect(stored).toContain("ordinary line 59");
     expect(stored).not.toContain("PRIVATE KEY");
   });
+
+  it("an unterminated PEM block covers every line to the end of the text", () => {
+    const text = ["intro", "-----BEGIN EC PRIVATE KEY-----", "MHcCAQEEIabc", "more"].join("\n");
+    expect(secretLineRanges(text)).toEqual([{ start: 2, end: 4 }]);
+  });
 });

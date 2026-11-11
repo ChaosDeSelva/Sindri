@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { Disclosure, InfoHint } from "@factory/ui";
+import { useState, type ReactNode } from "react";
 import type { ContextItemView, OpenQuestion, ProvenanceRef, Spec, SpecMeta } from "../api/types.js";
-import { Badge, Button, Field, inputClass } from "./ui.js";
+import { Badge, Button, Callout, Field, Status, textareaClass } from "./ui.js";
 
 export function refLabel(ref: ProvenanceRef, context: ContextItemView[] = []): string {
   if ("intakeId" in ref) return `intake:${ref.intakeId.slice(0, 8)}`;
@@ -18,37 +19,53 @@ export function refLabel(ref: ProvenanceRef, context: ContextItemView[] = []): s
 function Sources({ refs, context }: { refs: unknown; context: ContextItemView[] }) {
   if (!Array.isArray(refs) || refs.length === 0) return null;
   return (
-    <p className="text-xs text-slate-600 dark:text-slate-300">
+    <p className="mt-1 text-xs text-muted [overflow-wrap:anywhere]">
       Sources: {(refs as ProvenanceRef[]).map((r) => refLabel(r, context)).join(", ")}
     </p>
   );
 }
 
+/** One spec section: small heading (with an optional glossary hint) over its content. */
+function Part(props: { title: string; term?: string; children: ReactNode }) {
+  return (
+    <section className="flex min-w-0 flex-col gap-1.5">
+      <h4 className="flex items-center gap-1.5 text-sm font-semibold">
+        {props.title}
+        {props.term ? <InfoHint term={props.term} /> : null}
+      </h4>
+      {props.children}
+    </section>
+  );
+}
+
+const None = () => <p className="text-sm text-muted">None</p>;
+
 function List({
   title,
+  term,
   items,
   refs,
   context,
 }: {
   title: string;
+  term?: string;
   items: string[];
   refs: unknown;
   context: ContextItemView[];
 }) {
   return (
-    <section>
-      <h4 className="font-semibold">{title}</h4>
+    <Part title={title} {...(term ? { term } : {})}>
       {items.length === 0 ? (
-        <p className="text-sm italic text-slate-600 dark:text-slate-300">None</p>
+        <None />
       ) : (
-        <ul className="list-disc pl-5 text-sm">
+        <ul className="list-disc space-y-1 pl-5 text-sm [overflow-wrap:anywhere]">
           {items.map((t) => (
             <li key={t}>{t}</li>
           ))}
         </ul>
       )}
       <Sources refs={refs} context={context} />
-    </section>
+    </Part>
   );
 }
 
@@ -56,50 +73,47 @@ export function UntrustedBanner({ meta }: { meta: SpecMeta }) {
   if (!meta.untrustedInstructionDetected) return null;
   const sources = [...new Set(meta.injectionFindings.map((f) => f.source))];
   return (
-    <div
-      role="note"
-      aria-label="Untrusted instructions detected"
-      className="rounded border-2 border-amber-500 bg-amber-50 p-3 text-sm text-amber-950 dark:bg-amber-950 dark:text-amber-50"
-    >
-      <p className="font-semibold">Untrusted instructions detected</p>
-      <p>
+    <div role="note" aria-label="Untrusted instructions detected">
+      <Callout tone="warning" title="Untrusted instructions detected">
         Text in {sources.join(", ") || "the input"} looked like instructions to the model. It was
-        treated as data, redacted from the spec, and not followed.
-      </p>
+        treated as data, redacted from the spec, and not followed.{" "}
+        <InfoHint term="Flagged source instructions" />
+      </Callout>
     </div>
   );
 }
 
-const statusTone = (s: Spec["status"]) =>
-  s === "approved" ? "ok" : s === "review" ? "warn" : "neutral";
-
+/** `headless` drops the title block when the surrounding page already shows it. */
 export function SpecView({
   spec,
   meta,
   context = [],
+  headless = false,
 }: {
   spec: Spec;
   meta: SpecMeta | null;
   context?: ContextItemView[];
+  headless?: boolean;
 }) {
   const prov = spec.provenance as Record<string, unknown>;
   const acProv = (prov["acceptanceCriteria"] ?? {}) as Record<string, unknown>;
   const b = spec.body;
   return (
-    <article aria-label={`Specification ${spec.title}`} className="space-y-3">
-      <header className="space-y-1">
-        <h3 className="text-xl font-semibold">{spec.title}</h3>
-        <p className="text-sm">
-          Version {spec.version} <Badge tone={statusTone(spec.status)}>{spec.status}</Badge>
-          {spec.approvedBy ? <> · approved by {spec.approvedBy}</> : null}
-        </p>
-      </header>
+    <article aria-label={`Specification ${spec.title}`} className="flex min-w-0 flex-col gap-5">
+      {headless ? null : (
+        <header className="flex flex-col gap-1">
+          <h3 className="text-lg font-semibold [overflow-wrap:anywhere]">{spec.title}</h3>
+          <p className="flex flex-wrap items-center gap-2 text-sm text-muted">
+            Version {spec.version} <Status value={spec.status} domain="spec" />
+            {spec.approvedBy ? <span> · approved by {spec.approvedBy}</span> : null}
+          </p>
+        </header>
+      )}
       {meta ? <UntrustedBanner meta={meta} /> : null}
-      <section>
-        <h4 className="font-semibold">Problem</h4>
-        <p className="text-sm">{b.problem}</p>
+      <Part title="Problem">
+        <p className="text-sm [overflow-wrap:anywhere]">{b.problem}</p>
         <Sources refs={prov["problem"]} context={context} />
-      </section>
+      </Part>
       <List title="Goals" items={b.goals} refs={prov["goals"]} context={context} />
       <List title="Non-goals" items={b.nonGoals} refs={prov["nonGoals"]} context={context} />
       <List
@@ -108,13 +122,12 @@ export function SpecView({
         refs={prov["constraints"]}
         context={context}
       />
-      <List title="Risks" items={b.risks} refs={prov["risks"]} context={context} />
-      <section>
-        <h4 className="font-semibold">Assumptions</h4>
+      <List title="Risks" term="Risk" items={b.risks} refs={prov["risks"]} context={context} />
+      <Part title="Assumptions">
         {b.assumptions.length === 0 ? (
-          <p className="text-sm italic">None</p>
+          <None />
         ) : (
-          <ul className="list-disc pl-5 text-sm">
+          <ul className="list-disc space-y-1 pl-5 text-sm [overflow-wrap:anywhere]">
             {b.assumptions.map((a) => (
               <li key={a.text}>
                 {a.text} <Badge tone={a.risk === "high" ? "warn" : "neutral"}>{a.risk} risk</Badge>
@@ -122,10 +135,9 @@ export function SpecView({
             ))}
           </ul>
         )}
-      </section>
-      <section>
-        <h4 className="font-semibold">Acceptance criteria</h4>
-        <ul className="space-y-1 text-sm">
+      </Part>
+      <Part title="Acceptance criteria" term="Acceptance criterion">
+        <ul className="flex flex-col gap-2 text-sm [overflow-wrap:anywhere]">
           {b.acceptanceCriteria.map((ac) => (
             <li key={ac.id}>
               <span className="font-mono">{ac.id}</span> {ac.text} <Badge>{ac.verification}</Badge>
@@ -133,33 +145,37 @@ export function SpecView({
             </li>
           ))}
         </ul>
-      </section>
-      <section>
-        <h4 className="font-semibold">Open questions</h4>
+      </Part>
+      <Part title="Open questions" term="Open question">
         {b.openQuestions.length === 0 ? (
-          <p className="text-sm italic">None</p>
+          <None />
         ) : (
-          <ul className="text-sm">
+          <ul className="flex flex-col gap-2 text-sm [overflow-wrap:anywhere]">
             {b.openQuestions.map((q) => (
               <li key={q.id}>
                 <span className="font-mono">{q.id}</span> {q.text}{" "}
-                {q.blocking ? <Badge tone="warn">blocking</Badge> : <Badge>non-blocking</Badge>}
+                <Status value={q.blocking ? "blocking" : "non_blocking"} domain="open-question" />
+                {q.recommendation && (
+                  <p className="mt-1 ml-4">
+                    <span className="font-semibold">Recommended:</span> {q.recommendation}
+                    {q.rationale && <span className="block text-muted">{q.rationale}</span>}
+                  </p>
+                )}
               </li>
             ))}
           </ul>
         )}
-      </section>
+      </Part>
       {meta && meta.unverifiedClaims.length > 0 ? (
-        <section>
-          <h4 className="font-semibold">Unverified claims (moved to high-risk assumptions)</h4>
-          <ul className="list-disc pl-5 text-sm">
+        <Part title="Unverified claims (moved to high-risk assumptions)">
+          <ul className="list-disc pl-5 text-sm [overflow-wrap:anywhere]">
             {meta.unverifiedClaims.map((c) => (
               <li key={`${c.section}:${c.text}`}>
                 {c.section}: {c.text}
               </li>
             ))}
           </ul>
-        </section>
+        </Part>
       ) : null}
     </article>
   );
@@ -168,31 +184,40 @@ export function SpecView({
 export function ContextList({ items }: { items: ContextItemView[] }) {
   if (items.length === 0) return null;
   return (
-    <details className="text-sm">
-      <summary className="cursor-pointer font-semibold">
-        Loaded context ({items.length} cited items)
-      </summary>
-      <ul className="mt-2 space-y-1">
+    <Disclosure title={`Loaded context (${items.length} cited items)`}>
+      <ul className="flex flex-col gap-1.5">
         {items.map((c) => (
-          <li key={c.id}>
-            <Badge>{c.kind}</Badge> <span className="font-mono text-xs">{c.id.slice(0, 24)}</span>{" "}
-            {c.title}
+          <li key={c.id} className="flex min-w-0 flex-wrap items-center gap-2">
+            <Badge>{c.kind}</Badge>
+            <span className="font-mono text-xs text-muted [overflow-wrap:anywhere]">
+              {c.id.slice(0, 24)}
+            </span>
+            <span className="min-w-0 [overflow-wrap:anywhere]">{c.title}</span>
           </li>
         ))}
       </ul>
-    </details>
+    </Disclosure>
   );
 }
 
-export function BlockingQuestions(props: {
+/**
+ * Answer forms for a spec's open questions, blocking or not. Pass `answers`/`onAnswersChange` to
+ * keep typed text in the parent (each answer makes a new spec version, which may remount this).
+ */
+export function OpenQuestions(props: {
   questions: OpenQuestion[];
   busy: boolean;
   onAnswer: (questionId: string, answer: string) => void;
+  answers?: Record<string, string>;
+  onAnswersChange?: (answers: Record<string, string>) => void;
 }) {
-  const [answers, setAnswers] = useState<Record<string, string>>({});
-  if (props.questions.length === 0) return <p className="text-sm">No blocking questions remain.</p>;
+  const [local, setLocal] = useState<Record<string, string>>({});
+  const answers = props.answers ?? local;
+  const setAnswers = props.onAnswersChange ?? setLocal;
+  if (props.questions.length === 0)
+    return <p className="text-sm text-muted">No open questions remain.</p>;
   return (
-    <div className="space-y-3">
+    <div className="flex flex-col gap-3">
       {props.questions.map((q) => {
         const id = `answer-${q.id}`;
         const value = answers[q.id] ?? "";
@@ -200,27 +225,59 @@ export function BlockingQuestions(props: {
           <form
             key={q.id}
             aria-label={`Answer ${q.id}`}
-            className="space-y-2 rounded border border-amber-400 p-3"
+            className={`flex min-w-0 flex-col gap-3 rounded-md border p-4 ${
+              q.blocking ? "border-warning-border" : "border-line"
+            }`}
             onSubmit={(e) => {
               e.preventDefault();
               if (value.trim()) props.onAnswer(q.id, value.trim());
             }}
           >
+            <span>
+              <Status value={q.blocking ? "blocking" : "non_blocking"} domain="open-question" />
+            </span>
             <Field label={`${q.id}: ${q.text}`} id={id}>
               <textarea
                 id={id}
                 rows={2}
-                className={inputClass}
+                className={textareaClass}
                 value={value}
                 onChange={(e) => setAnswers({ ...answers, [q.id]: e.target.value })}
               />
             </Field>
-            <Button type="submit" disabled={props.busy || !value.trim()}>
-              Submit answer <span className="sr-only">to {q.id}</span>
-            </Button>
+            {q.recommendation && (
+              <div className="flex flex-col items-start gap-2 rounded-md bg-sunken p-3 text-sm">
+                <p className="[overflow-wrap:anywhere]">
+                  <span className="font-semibold">Recommended answer:</span> {q.recommendation}
+                </p>
+                {q.rationale && <p className="text-muted">Why: {q.rationale}</p>}
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={props.busy}
+                  onClick={() => setAnswers({ ...answers, [q.id]: q.recommendation ?? "" })}
+                >
+                  Use recommendation <span className="sr-only">for {q.id}</span>
+                </Button>
+              </div>
+            )}
+            <div>
+              <Button
+                type="submit"
+                disabled={props.busy}
+                {...(!props.busy && !value.trim()
+                  ? { disabledReason: "Type or accept an answer first." }
+                  : {})}
+              >
+                Submit answer <span className="sr-only">to {q.id}</span>
+              </Button>
+            </div>
           </form>
         );
       })}
     </div>
   );
 }
+
+/** Alias under the old name: it renders non-blocking questions too. */
+export const BlockingQuestions = OpenQuestions;

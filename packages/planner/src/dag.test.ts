@@ -105,6 +105,13 @@ describe("validatePlan", () => {
     expect(issues).toMatch(/total costUsd 12 exceeds cap 10/);
     expect(issues).toMatch(/4 tasks exceeds cap 3/);
   });
+
+  it("requires a token budget while a token cap applies (no budget means an uncapped crew)", () => {
+    const open = tasks().map((x) => ({ ...x, budget: { wallClockMinutes: 30 } }));
+    const issues = validatePlan({ tasks: open }, { spec, caps: DEFAULT_CAPS }).join("\n");
+    expect(issues).toMatch(/impl: tokens budget is required while a token cap applies/);
+    expect(validatePlan({ tasks: open }, { spec, caps: {} })).toEqual([]);
+  });
 });
 
 describe("estimatePlan", () => {
@@ -121,6 +128,20 @@ describe("estimatePlan", () => {
       tokens: 10,
       costUsd: null,
     });
+  });
+
+  it("refuses a cycle unless told to tolerate it", () => {
+    const cyclic = [t("a", { dependsOn: ["b"] }), t("b", { dependsOn: ["a"] }), t("c")];
+    expect(() => estimatePlan(cyclic)).toThrow("dependency cycle among a, b");
+    expect(estimatePlan(cyclic, { tolerateCycles: true })).toMatchObject({
+      taskCount: 3,
+      wallClockMinutes: 90,
+      criticalPathMinutes: 30,
+    });
+  });
+
+  it("starts a task whose dependency is not in the plan at time zero", () => {
+    expect(estimatePlan([t("a", { dependsOn: ["gone"] })]).criticalPathMinutes).toBe(30);
   });
 });
 

@@ -114,7 +114,13 @@ describe("director", () => {
     const { spec } = await draft();
     const q = await h.call({ method: "GET", url: `/v1/specs/${spec.id}/questions` });
     expect(q.json().questions).toEqual([
-      { id: "Q1", text: "Which columns must the CSV include?", blocking: true },
+      {
+        id: "Q1",
+        text: "Which columns must the CSV include?",
+        blocking: true,
+        recommendation: "Date, customer and total",
+        rationale: "The reports page already lists these columns.",
+      },
     ]);
     const ans = await h.call({
       method: "POST",
@@ -203,6 +209,23 @@ describe("specs", () => {
       status: "approved",
       approvedBy: expect.stringMatching(/^local:.+\/web#aps_[0-9a-f]+$/),
     });
+  });
+
+  it("refuses to submit a spec that has no acceptance criteria", async () => {
+    // What a draft looks like when every drafted criterion was demoted to an assumption.
+    provider = new FakeProvider((req, i) => {
+      const r = demoResponder()(req, i);
+      return req.metadata?.purpose === "draft_spec"
+        ? { ...r, output: { ...(r.output as object), acceptanceCriteria: [] } }
+        : r;
+    });
+    const { spec } = await draft();
+    expect(spec.body.acceptanceCriteria).toEqual([]);
+    const sub = await h.call({ method: "POST", url: `/v1/specs/${spec.id}/submit`, payload: {} });
+    expect(sub.statusCode).toBe(409);
+    expect(sub.json().error.code).toBe("invalid_state");
+    expect(sub.json().error.message).toMatch(/no acceptance criteria/);
+    expect((await h.call({ url: `/v1/specs/${spec.id}` })).json().spec.status).toBe("draft");
   });
 
   it("revises a draft into a new version and validates patches", async () => {

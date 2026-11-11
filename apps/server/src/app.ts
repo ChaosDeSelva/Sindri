@@ -5,8 +5,12 @@ import { deliveryPurgeTargets } from "./delivery-purge.js";
 import { DISPLAY_SANITIZED, forDisplay } from "./display.js";
 import { ApiError, envelope, toApiError } from "./errors.js";
 import { createFactory, type FactoryOptions } from "./factory.js";
+import { changeRoutes } from "./routes/changes.js";
 import { deliveryRoutes } from "./routes/deliveries.js";
 import { executionRoutes } from "./routes/executions.js";
+import { feedbackGraphRoutes } from "./routes/feedback-graph.js";
+import type { DocsSource } from "@sindri/director";
+import { GUIDE_CLIENT_HEADER, guideRoutes } from "./routes/guide.js";
 import { harnessRoutes } from "./routes/harnesses.js";
 import { intakeRoutes } from "./routes/intakes.js";
 import { knowledgeRoutes } from "./routes/knowledge.js";
@@ -16,6 +20,7 @@ import { approvalRoutes, NO_IDEMPOTENCY, REDACTED_RECEIPT } from "./routes/appro
 import { projectRoutes } from "./routes/projects.js";
 import { settingsRoutes } from "./routes/settings.js";
 import { specRoutes } from "./routes/specs.js";
+import { stewardRoutes, type StewardServerOptions } from "./routes/steward.js";
 import { APPROVAL_HEADER, ApprovalAuthority, type ApprovalOptions } from "./approval.js";
 import { isLoopbackHostHeader, tokenMatches } from "./security.js";
 import { createServices, type ServiceOptions, type Services } from "./services.js";
@@ -43,10 +48,14 @@ export interface BuildServerOptions extends ServiceOptions, FactoryOptions {
   resumeOnReady?: boolean;
   /** Approval pairing code handling (audit M9); the code reaches only `onPairingCode`. */
   approval?: ApprovalOptions;
+  /** The steward loop (docs/steward.md). */
+  steward?: StewardServerOptions;
+  /** Docs the read-only Guide answers from. Default: none, and it says so; `startServer` passes `@factory/docs`. */
+  docs?: DocsSource;
 }
 
 const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
-const ALLOWED_HEADERS = `authorization, content-type, idempotency-key, ${APPROVAL_HEADER}`;
+const ALLOWED_HEADERS = `authorization, content-type, idempotency-key, ${APPROVAL_HEADER}, ${GUIDE_CLIENT_HEADER}`;
 const REDACT = [
   "req.headers.authorization",
   `req.headers["${APPROVAL_HEADER}"]`,
@@ -55,10 +64,19 @@ const REDACT = [
   'req.headers["proxy-authorization"]',
 ];
 
+/**
+ * The path a request is handled as. The router matches the percent-decoded path (`/%761/x` is
+ * `/v1/x`), so a matched request is judged by its route pattern; an unmatched one by its URL.
+ */
+const routePath = (req: FastifyRequest): string => req.routeOptions.url ?? req.url;
+const isApi = (req: FastifyRequest) =>
+  routePath(req).startsWith("/v1/") || req.url.startsWith("/v1/");
+
 /** The project a mutation belongs to: from the URL, the body, or the response. */
 function projectIdOf(req: FastifyRequest, responseBody: string): string | null {
   const params = (req.params ?? {}) as Record<string, unknown>;
-  if (req.url.startsWith("/v1/projects/") && typeof params["id"] === "string") return params["id"];
+  if (routePath(req).startsWith("/v1/projects/") && typeof params["id"] === "string")
+    return params["id"];
   const body = req.body as Record<string, unknown> | null | undefined;
   if (body && typeof body === "object" && typeof body["projectId"] === "string")
     return body["projectId"];
@@ -114,7 +132,7 @@ export function buildServer(opts: BuildServerOptions): FastifyInstance {
   );
 
   app.addHook("onRequest", async (req, reply) => {
-    if (!req.url.startsWith("/v1/")) return;
+    if (!isApi(req)) return;
     if (!opts.allowRemote && !isLoopbackHostHeader(req.headers.host))
       throw new ApiError(403, "host_forbidden", "Host header must be a loopback address");
     const origin = req.headers.origin;
@@ -131,13 +149,13 @@ export function buildServer(opts: BuildServerOptions): FastifyInstance {
       reply.header("access-control-max-age", "600");
       return reply.code(204).send();
     }
-    if (req.url === "/v1/health" || req.url.startsWith("/v1/health?")) return;
+    if (routePath(req) === "/v1/health") return;
     if (!tokenMatches(req.headers.authorization, opts.authToken))
       throw new ApiError(401, "unauthorized", "a valid bearer token is required");
   });
 
   app.addHook("preHandler", async (req, reply) => {
-    if (!MUTATING.has(req.method) || !req.url.startsWith("/v1/")) return;
+    if (!MUTATING.has(req.method) || !isApi(req)) return;
     const config = req.routeOptions.config as unknown as Record<string, unknown> | undefined;
     if (config?.[NO_IDEMPOTENCY] === true) return;
     const raw = req.headers["idempotency-key"];
@@ -160,7 +178,7 @@ export function buildServer(opts: BuildServerOptions): FastifyInstance {
   // Every JSON response except settings is display-sanitized server-side.
   // Routes whose text was sanitized when stored opt out (successful responses only).
   app.addHook("preSerialization", async (req, reply, payload) =>
-    req.url.startsWith("/v1/settings") ||
+    routePath(req).startsWith("/v1/settings") ||
     (reply.statusCode < 400 &&
       (req.routeOptions.config as unknown as Record<string, unknown> | undefined)?.[
         DISPLAY_SANITIZED
@@ -221,10 +239,11 @@ export function buildServer(opts: BuildServerOptions): FastifyInstance {
     ...(opts.now ? { now: opts.now } : {}),
   });
   approvalRoutes(app, approvals);
-  projectRoutes(app, services);
+  projectRoutes(app, services, approvals);
   intakeRoutes(app, services);
   specRoutes(app, services, approvals);
   knowledgeRoutes(app, services);
+  feedbackGraphRoutes(app, services);
   const factory = createFactory(
     {
       onRunError: (executionId, err) => app.log.error({ err, executionId }, "delivery run failed"),
@@ -233,15 +252,28 @@ export function buildServer(opts: BuildServerOptions): FastifyInstance {
     },
     services,
   );
+  // Before the execution routes, so its preClose stops the loop before the hub closes.
+  stewardRoutes(app, services, factory, approvals, {
+    ...opts.steward,
+    authToken: opts.authToken,
+    now: opts.now ?? (() => new Date()),
+    ...(opts.resumeOnReady !== undefined ? { resumeOnReady: opts.resumeOnReady } : {}),
+    fixedProvider: opts.providerFactory !== undefined || opts.director !== undefined,
+  });
   planRoutes(app, services, factory, approvals);
   harnessRoutes(app, services, factory);
+  guideRoutes(app, services, factory, {
+    ...(opts.docs ? { docs: opts.docs } : {}),
+    ...(opts.now ? { now: opts.now } : {}),
+  });
   executionRoutes(app, services, factory, factory.hub, factory.delivery, approvals);
+  changeRoutes(app, services.db);
   // Resume runs interrupted by a restart, without waiting for a client (review I2).
   app.addHook("onReady", async () => {
     if (opts.resumeOnReady !== false) void factory.resume();
   });
   app.addHook("preClose", async () => factory.close());
-  deliveryRoutes(app, services, factory.hub, factory.delivery, approvals);
+  deliveryRoutes(app, services, factory.hub, factory.delivery, approvals, factory);
   settingsRoutes(app, services, {
     approvals,
     beforePurge: async (projectId) => {

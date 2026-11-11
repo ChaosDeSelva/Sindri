@@ -1,7 +1,13 @@
 import { realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
-import { createMimirClient, type GapInfo, type MimirClient } from "@mimir/sdk";
+import {
+  createMimirClient,
+  errorFromResponse,
+  randomKey,
+  type GapInfo,
+  type MimirClient,
+} from "@mimir/sdk";
 import {
   parseEvent,
   CreateTaskRequestSchema,
@@ -27,6 +33,12 @@ import { applyMigrations, type SqliteDatabase } from "@sindri/knowledge";
 import type { Plan, Role } from "@sindri/planner";
 import { mapPlan, type AgentKindResolver, type MappedPlan } from "./mapping.js";
 import { MIMIR_CLIENT_MIGRATIONS } from "./migrations.js";
+import {
+  OWNED_SETTINGS,
+  profileSettingsFromDb,
+  sameJson,
+  type ProfileProjectSettings,
+} from "./project-settings.js";
 
 export type MimirClientErrorCode =
   "not_connected" | "invalid_plan" | "submission_mismatch" | "not_supported" | "hash_mismatch";
@@ -48,6 +60,14 @@ export interface MimirClientFacadeOptions {
   agentKindFor?: AgentKindResolver;
   /** Per-role crew concurrency, merged over the planner's `DEFAULT_CONCURRENCY`. */
   concurrency?: Partial<Record<Role, number>>;
+  /**
+   * The Mimir project settings Sindri owns for a repository (agent environment, verification
+   * timeout); undefined leaves the Mimir project's settings alone. Default: derived from the
+   * execution profile of the Sindri project stored for that path in `db`.
+   */
+  projectSettingsFor?: (repoPath: string) => ProfileProjectSettings | undefined;
+  /** Non-fatal problems (default `console.warn`). */
+  onWarn?: (msg: string, fields?: Record<string, unknown>) => void;
   /** Injected `fetch` (tests). */
   fetch?: typeof fetch;
   now?: () => Date;
@@ -96,6 +116,7 @@ export interface FollowStream extends AsyncIterable<MimirEvent> {
  */
 export class MimirClientFacade {
   private client: MimirClient | undefined;
+  private target: (ConnectConfig & { fetch: typeof fetch }) | undefined;
   private readonly db: SqliteDatabase;
   private readonly now: () => Date;
 
@@ -107,6 +128,7 @@ export class MimirClientFacade {
 
   connect(config: ConnectConfig): this {
     const f = this.options.fetch ?? globalThis.fetch.bind(globalThis);
+    this.target = { ...config, fetch: f };
     this.client = createMimirClient({
       baseUrl: config.baseUrl,
       token: config.token,
@@ -125,8 +147,16 @@ export class MimirClientFacade {
     return this.sdk.capabilities();
   }
 
-  /** The Mimir project for `repoPath`, created once (idempotently) when missing. */
+  /**
+   * The Mimir project for `repoPath`, created once (idempotently) when missing. The settings
+   * Sindri owns (`projectSettingsFor`) go into a new project and are brought up to date on an
+   * existing one.
+   */
   async ensureProject(repoPath: string, settings: Record<string, unknown> = {}): Promise<Project> {
+    const owned = (
+      this.options.projectSettingsFor ?? ((p: string) => profileSettingsFromDb(this.db, p))
+    )(repoPath);
+    if (owned) settings = { ...settings, ...owned };
     // Mimir records canonical git roots; macOS temp paths commonly contain symlinks.
     try {
       repoPath = realpathSync(repoPath);
@@ -135,8 +165,11 @@ export class MimirClientFacade {
     }
     const { projects } = await this.sdk.projects.list();
     const existing = projects.find((p) => p.repoPath === repoPath);
-    if (existing) return existing;
+    if (existing) return owned ? this.syncProjectSettings(existing, owned) : existing;
     const key = `sindri:project:${createHash("sha256").update(repoPath).digest("hex").slice(0, 32)}`;
+    // Mimir has no project for this path, so a local record of creating one is stale (another
+    // or a reset Mimir): replaying it would return a project that does not exist there.
+    this.db.prepare("DELETE FROM mimir_submissions WHERE idempotency_key = ?").run(key);
     const { project } = await this.submit("project", key, async () => {
       const res = await this.sdk.projects.create(
         { name: basename(repoPath) || repoPath, repoPath, settings },
@@ -148,13 +181,66 @@ export class MimirClientFacade {
   }
 
   /**
+   * Replaces the settings of an existing Mimir project when the keys Sindri owns differ from
+   * `owned`; the project's other settings are sent back unchanged. `PATCH /v1/projects/:id` is
+   * newer than the vendored SDK, so it is a plain authenticated request; a Mimir without the
+   * route (404/405) is left as it is.
+   */
+  private async syncProjectSettings(
+    project: Project,
+    owned: ProfileProjectSettings,
+  ): Promise<Project> {
+    const rest: Record<string, unknown> = { ...project.settings };
+    const current: Record<string, unknown> = {};
+    for (const key of OWNED_SETTINGS) {
+      if (rest[key] !== undefined) current[key] = rest[key];
+      delete rest[key];
+    }
+    if (sameJson(current, owned) || !this.target) return project;
+    const settings = { ...rest, ...owned };
+    const { baseUrl, token, fetch: f } = this.target;
+    const res = await f(
+      `${baseUrl.replace(/\/+$/, "")}/v1/projects/${encodeURIComponent(project.id)}`,
+      {
+        method: "PATCH",
+        headers: {
+          accept: "application/json",
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          "idempotency-key": randomKey(),
+        },
+        body: JSON.stringify({ settings }),
+      },
+    );
+    if (res.status === 404 || res.status === 405) {
+      (this.options.onWarn ?? ((msg, fields) => console.warn(msg, fields)))(
+        "Mimir does not support updating project settings; the execution profile was not applied",
+        { projectId: project.id, status: res.status },
+      );
+      return project;
+    }
+    if (!res.ok) throw await errorFromResponse(res);
+    const body = (await res.json().catch(() => null)) as { project?: Project } | null;
+    return body?.project?.id === project.id ? body.project : { ...project, settings };
+  }
+
+  /**
    * Creates the mission, one crew per distinct (harnessId, role) and one task per plan task, in
    * dependency order. Every mutation uses a key derived from the plan, and completed ones are
    * recorded locally, so re-running after a crash creates nothing new.
    */
   async createMissionFromPlan(
     plan: Plan,
-    { projectId, run }: { projectId: ProjectId | string; run?: number },
+    {
+      projectId,
+      run,
+      baseCommits,
+    }: {
+      projectId: ProjectId | string;
+      run?: number;
+      /** Commits the mission's root tasks start from instead of the default branch (a rework). */
+      baseCommits?: readonly string[];
+    },
   ): Promise<MissionSubmission> {
     let mapped;
     try {
@@ -175,7 +261,12 @@ export class MimirClientFacade {
     const head = fresh ? (await client.snapshot()).cursor : undefined;
     const { mission } = await this.submit("mission", mapped.missionIdempotencyKey, async () => {
       const res = await client.missions.create(
-        { projectId: projectId as ProjectId, objective: mapped.objective },
+        {
+          projectId: projectId as ProjectId,
+          objective: mapped.objective,
+          // `baseCommits` is newer than the vendored @mimir/protocol types; the server accepts it.
+          ...(baseCommits?.length ? ({ baseCommits: [...baseCommits] } as object) : {}),
+        },
         { idempotencyKey: mapped.missionIdempotencyKey },
       );
       return { id: res.mission.id, value: res };
@@ -257,8 +348,11 @@ export class MimirClientFacade {
   }
 
   async cancel(missionId: MissionId | string, reason?: string): Promise<void> {
+    // The key names the reason too: Mimir refuses a key reused with another body, so a second
+    // cancel for another reason (after one that went through) must get Mimir's own answer.
+    const why = reason ? `:${createHash("sha256").update(reason).digest("hex").slice(0, 16)}` : "";
     await this.sdk.missions.cancel(missionId as MissionId, reason ? { reason } : {}, {
-      idempotencyKey: `sindri:cancel:${missionId}`,
+      idempotencyKey: `sindri:cancel:${missionId}${why}`,
     });
   }
 
@@ -445,6 +539,16 @@ export class MimirClientFacade {
       { idempotencyKey },
     );
     return { crewId: res.crew.id };
+  }
+
+  /** The verified result commit of each mission task that has one. */
+  async taskResultCommits(
+    missionId: MissionId | string,
+  ): Promise<{ taskId: string; resultCommit: string }[]> {
+    const { tasks } = await this.sdk.tasks.list({ missionId: missionId as MissionId });
+    return tasks.flatMap((t) =>
+      t.resultCommit ? [{ taskId: t.id as string, resultCommit: t.resultCommit }] : [],
+    );
   }
 
   /** Adds a task to a (non-terminal) mission: `client.tasks.create` (`POST /v1/tasks`). */

@@ -70,8 +70,14 @@ export function deliveryMethods(call: Call, send: Send) {
       (await call<{ dryRun: DryRun }>("GET", `/v1/plans/${enc(id)}/dry-run`)).dryRun,
     submitPlan: async (id: string) =>
       (await call<{ plan: Plan }>("POST", `/v1/plans/${enc(id)}/submit`)).plan,
-    approvePlan: async (id: string) =>
-      (await call<{ plan: Plan }>("POST", `/v1/plans/${enc(id)}/approve`, {})).plan,
+    approvePlan: async (id: string, opts: { acknowledgeUntrusted?: boolean } = {}) =>
+      (
+        await call<{ plan: Plan }>(
+          "POST",
+          `/v1/plans/${enc(id)}/approve`,
+          opts.acknowledgeUntrusted ? { acknowledgeUntrusted: true } : {},
+        )
+      ).plan,
     revisePlan: async (id: string, tasks: PlanTask[]) =>
       (await call<{ plan: Plan }>("POST", `/v1/plans/${enc(id)}/revise`, { tasks })).plan,
 
@@ -112,6 +118,13 @@ export function deliveryMethods(call: Call, send: Send) {
         "POST",
         `/v1/executions/${enc(executionId)}/approvals/${enc(approvalId)}`,
         reason ? { decision, reason } : { decision },
+      ),
+    /** Stops a run for good; the server answers 409 when it has already finished. */
+    cancelExecution: (executionId: string, reason?: string) =>
+      call<ExecutionDetail>(
+        "POST",
+        `/v1/executions/${enc(executionId)}/cancel`,
+        reason ? { reason } : {},
       ),
     resolveEscalation: (
       executionId: string,
@@ -198,6 +211,7 @@ export const DELIVERY_METHOD_NAMES = [
   "listExecutions",
   "getExecution",
   "decideApproval",
+  "cancelExecution",
   "resolveEscalation",
   "requestPr",
   "assessExecution",

@@ -3,7 +3,9 @@ import type { ReactElement } from "react";
 import { vi, type Mock } from "vitest";
 import type { ApiClient } from "../api/client.js";
 import { DELIVERY_METHOD_NAMES } from "../api/delivery-client.js";
+import { STEWARD_METHOD_NAMES } from "../api/steward-client.js";
 import type { Project } from "../api/types.js";
+import { SindriLinks } from "../components/Layout.js";
 import { AppProviders } from "../store/context.js";
 import type { State } from "../store/reducer.js";
 
@@ -13,12 +15,16 @@ export type MockApi = { [K in keyof ApiClient]: Mock };
 export function mockApi(over: Partial<Record<keyof ApiClient, unknown>> = {}): MockApi {
   const names: (keyof ApiClient)[] = [
     "health",
+    "streamChanges",
+    "askGuide",
     "capabilities",
     "listProjects",
     "getProject",
     "createProject",
     "bootstrap",
     "search",
+    "getProfile",
+    "putProfile",
     "deleteProjectData",
     "listIntakes",
     "getIntake",
@@ -44,7 +50,14 @@ export function mockApi(over: Partial<Record<keyof ApiClient, unknown>> = {}): M
     "getSettings",
     "putSettings",
     "exportData",
+    "requestRework",
+    "listReworks",
+    "listProposals",
+    "proposeKnowledge",
+    "decideProposal",
+    "forgetApproval",
     ...DELIVERY_METHOD_NAMES,
+    ...STEWARD_METHOD_NAMES,
   ];
   const api = {} as MockApi;
   for (const n of names) {
@@ -57,8 +70,15 @@ export function mockApi(over: Partial<Record<keyof ApiClient, unknown>> = {}): M
           : () => Promise.resolve(impl),
     );
   }
+  // The change stream connects (version 0) and stays open unless a test says otherwise.
+  if (over.streamChanges === undefined)
+    api.streamChanges = vi.fn((onChange: (v: number) => void) => {
+      onChange(0);
+      return new Promise<void>(() => undefined);
+    });
   // Approvals are unlocked unless a test says otherwise (audit M9 has its own tests).
   if (over.hasApprovalSession === undefined) api.hasApprovalSession = vi.fn(() => true);
+  if (over.forgetApproval === undefined) api.forgetApproval = vi.fn();
   if (over.unlockApprovals === undefined)
     api.unlockApprovals = vi.fn(() =>
       Promise.resolve({ principal: "local:test/web#aps_1", expiresAt: "" }),
@@ -74,7 +94,7 @@ export function renderWithStore(ui: ReactElement, api: MockApi, initial: Partial
       api={api as unknown as ApiClient}
       initial={{ token: "tok", projects: [PROJECT], projectId: PROJECT.id, ...initial }}
     >
-      {ui}
+      <SindriLinks>{ui}</SindriLinks>
     </AppProviders>,
   );
 }

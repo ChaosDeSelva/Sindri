@@ -19,7 +19,32 @@ describe("hash routes (audit S-I1)", () => {
       planId: null,
       executionId: "exe_1",
       deliveryId: null,
+      docsSlug: null,
+      docsSection: null,
     });
+  });
+
+  it("opens the old Reviews hash as Needs you, and docs pages with a section", () => {
+    expect(parseHash("#/reviews?project=p1")).toMatchObject({ view: "needs-you", projectId: "p1" });
+    const docs = {
+      ...initialState({}),
+      view: "docs" as const,
+      docsSlug: "glossary",
+      docsSection: "steward",
+    };
+    expect(routeHash(docs)).toBe("#/docs/glossary?section=steward");
+    expect(parseHash("#/docs/glossary?section=steward")).toMatchObject({
+      view: "docs",
+      docsSlug: "glossary",
+      docsSection: "steward",
+    });
+    // A section on another view is not part of its route.
+    expect(routeHash({ ...docs, view: "runs" })).toBe("#/runs");
+  });
+
+  it("routes to the Autonomy view", () => {
+    expect(parseHash("#/autonomy?project=p1")).toMatchObject({ view: "autonomy", projectId: "p1" });
+    expect(routeHash({ ...initialState({}), view: "autonomy" })).toBe("#/autonomy");
   });
 
   it("ignores unknown views and empty hashes", () => {

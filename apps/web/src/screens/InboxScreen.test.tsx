@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { ApiError } from "../api/client.js";
 import { NoticeRegion } from "../components/Layout.js";
 import { intake } from "../test/fixtures.js";
+import { useStore } from "../store/context.js";
 import { mockApi, renderWithStore } from "../test/utils.js";
 import { InboxScreen } from "./InboxScreen.js";
 
@@ -64,8 +65,9 @@ describe("InboxScreen", () => {
         ),
     });
     renderWithStore(ui, api);
+    await userEvent.click(screen.getByRole("tab", { name: "Import a ticket" }));
     await userEvent.type(
-      screen.getByLabelText("Jira or Linear URL"),
+      await screen.findByLabelText("Jira or Linear URL"),
       "https://acme.atlassian.net/browse/X-1",
     );
     await userEvent.click(screen.getByRole("button", { name: "Import" }));
@@ -83,5 +85,48 @@ describe("InboxScreen", () => {
     const detail = await screen.findByRole("article", { name: "Intake detail" });
     expect(within(detail).getByText("Hi")).toBeTruthy();
     expect(detail.querySelector("img")).toBeNull();
+  });
+
+  it("hands an item to the Director with its title as the request (L7)", async () => {
+    function Where() {
+      const { state } = useStore();
+      const seed = state.directorSeed;
+      return (
+        <output data-testid="where">{`${state.view}:${seed?.intakeId}:${seed?.request}`}</output>
+      );
+    }
+    const rec = intake();
+    const api = mockApi({ listIntakes: [rec], getIntake: { intake: rec, comments: [] } });
+    renderWithStore(
+      <>
+        {ui}
+        <Where />
+      </>,
+      api,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /Add CSV/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "Draft spec from this" }));
+    expect(screen.getByTestId("where").textContent).toBe("director:i1:Add CSV");
+  });
+});
+
+describe("InboxScreen layout", () => {
+  it("leads with the page title and reopens the add form from the header after viewing an item", async () => {
+    const item = intake({ id: "i1", display: { title: "Add CSV", body: "Body" } });
+    renderWithStore(
+      ui,
+      mockApi({ listIntakes: [item], getIntake: { intake: item, comments: [] } }),
+    );
+    expect(await screen.findByRole("heading", { level: 1, name: "Inbox" })).toBeTruthy();
+    // The add form shows while nothing is open; a soft-disabled submit says why.
+    const add = screen.getByRole("button", { name: /^Add to inbox/ });
+    expect(add.getAttribute("aria-disabled")).toBe("true");
+    expect(add.textContent).toMatch(/Give it a title first/);
+    await userEvent.click(await screen.findByRole("button", { name: /Add CSV/ }));
+    expect(await screen.findByRole("article", { name: "Intake detail" })).toBeTruthy();
+    expect(screen.queryByRole("form", { name: "Manual intake" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Add item" }));
+    expect(screen.getByRole("form", { name: "Manual intake" })).toBeTruthy();
+    expect(screen.queryByRole("article", { name: "Intake detail" })).toBeNull();
   });
 });

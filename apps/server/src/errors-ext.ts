@@ -7,7 +7,7 @@ import {
 } from "@sindri/delivery";
 import { HarnessServiceError } from "@sindri/harnesses";
 import { isMimirError, MimirClientError } from "@sindri/mimir-client";
-import { PlanStateError, PlanValidationError } from "@sindri/planner";
+import { PlanStateError, PlanUntrustedError, PlanValidationError } from "@sindri/planner";
 import { ApiError } from "./errors.js";
 
 /**
@@ -18,14 +18,13 @@ export function domainApiError(err: unknown): ApiError | null {
   if (err instanceof PlanValidationError)
     return new ApiError(422, "validation_failed", "plan validation failed", err.issues);
   if (err instanceof PlanStateError) return new ApiError(409, "invalid_state", err.message);
+  if (err instanceof PlanUntrustedError)
+    return new ApiError(409, "untrusted_unacknowledged", err.message);
   if (err instanceof HarnessServiceError) {
     switch (err.code) {
+      // Never raised (Brokkr is resolved through its SDK), but still in the harness error type.
       case "not_wired":
-        return new ApiError(
-          503,
-          "brokkr_unavailable",
-          "Brokkr is enabled but its SDK is not wired into Sindri yet",
-        );
+        return new ApiError(503, "brokkr_unavailable", "Brokkr is enabled but not available");
       case "not_found":
         return new ApiError(404, "not_found", "harness not found");
       default:

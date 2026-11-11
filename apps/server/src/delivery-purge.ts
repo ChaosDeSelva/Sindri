@@ -9,8 +9,15 @@ import type { SqliteDatabase } from "@sindri/knowledge";
  * through the project's plans and executions.
  */
 const TABLES = [
+  // Steward decisions about the project, their history, notes and guidance (children first).
+  "steward_notes",
+  "steward_decision_history",
+  "steward_guidance",
+  "steward_decisions",
   // The server's own settle-assessment markers.
   "quality_assessments",
+  // Reviewer feedback on a delivery is project text too.
+  "rework_requests",
   "pr_requests",
   "delivery_evidence",
   "knowledge_proposals",

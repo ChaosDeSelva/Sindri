@@ -20,7 +20,8 @@ export class PlanValidationError extends Error {
 export function topoOrder(tasks: readonly DagTask[]): { order: string[]; cycle: string[] } {
   const ids = new Set(tasks.map((t) => t.id));
   const indegree = new Map<string, number>();
-  for (const t of tasks) indegree.set(t.id, t.dependsOn.filter((d) => ids.has(d)).length);
+  // Distinct dependencies: one listed twice is released once below, so it must count once.
+  for (const t of tasks) indegree.set(t.id, new Set(t.dependsOn.filter((d) => ids.has(d))).size);
   const order: string[] = [];
   const queue = tasks.filter((t) => indegree.get(t.id) === 0).map((t) => t.id);
   while (queue.length > 0) {
@@ -54,7 +55,21 @@ export function validatePlan(plan: { tasks: readonly PlanTask[] }, ctx: Validate
   const issues: string[] = [];
   const caps = ctx.caps ?? {};
   const ids = new Set<string>();
-  for (const task of plan.tasks) {
+  /** Entries the checks below cannot read (no dependency list, criteria list or budget). */
+  let unreadable = false;
+  for (const [i, task] of plan.tasks.entries()) {
+    if (typeof task !== "object" || task === null) {
+      issues.push(`task ${i} is not an object`);
+      unreadable = true;
+      continue;
+    }
+    if (
+      !Array.isArray(task.dependsOn) ||
+      !Array.isArray(task.acceptanceCriteria) ||
+      typeof task.budget !== "object" ||
+      task.budget === null
+    )
+      unreadable = true;
     if ((task.role as string) === "delegate" || !(ROLES as readonly string[]).includes(task.role)) {
       issues.push(
         `${task.id}: role "${task.role}" is not allowed: tasks may not delegate further work`,
@@ -67,6 +82,8 @@ export function validatePlan(plan: { tasks: readonly PlanTask[] }, ctx: Validate
     if (ids.has(task.id)) issues.push(`duplicate task id ${task.id}`);
     ids.add(task.id);
   }
+  // The schema issues above already name what is missing; the graph checks need those fields.
+  if (unreadable) return issues;
   for (const task of plan.tasks)
     for (const d of task.dependsOn) {
       if (d === task.id) issues.push(`${task.id} depends on itself`);
@@ -83,7 +100,11 @@ export function validatePlan(plan: { tasks: readonly PlanTask[] }, ctx: Validate
     for (const id of task.acceptanceCriteria)
       if (!known.has(id)) issues.push(`${task.id} references unknown acceptance criterion ${id}`);
 
+  const tokenCapped = caps.maxTaskTokens !== undefined || caps.maxTotalTokens !== undefined;
   for (const task of plan.tasks) {
+    // Mimir gets a crew budget only from task token budgets: a missing one would be uncapped.
+    if (tokenCapped && task.budget.tokens === undefined)
+      issues.push(`${task.id}: tokens budget is required while a token cap applies`);
     issues.push(
       ...over(`${task.id}: maxRetries`, task.maxRetries, caps.maxRetries),
       ...over(
@@ -172,7 +193,12 @@ export function dryRun(
   const { cycle } = topoOrder(plan.tasks);
   if (cycle.length > 0)
     throw new PlanValidationError([`dependency cycle among ${cycle.join(", ")}`]);
-  const ids = new Set(plan.tasks.map((t) => t.id));
+  const ids = new Set<string>();
+  for (const t of plan.tasks) {
+    // Progress below is tracked per id: with a repeated id the loop would never finish.
+    if (ids.has(t.id)) throw new PlanValidationError([`duplicate task id ${t.id}`]);
+    ids.add(t.id);
+  }
   const unknown = plan.tasks.flatMap((t) =>
     t.dependsOn.filter((d) => !ids.has(d)).map((d) => `${t.id} depends on unknown task ${d}`),
   );

@@ -3,12 +3,16 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { ApprovalAuthority } from "../approval.js";
 import { ApiError, notFound, parseBody } from "../errors.js";
+import { profileHarness } from "../execution-profile.js";
 import type { Factory } from "../factory.js";
 import type { Services } from "../services.js";
 
 const Propose = z.strictObject({ specId: z.string().min(1).max(200) });
-/** The approver is the authenticated approval principal (audit M9); the body is empty. */
-const Approve = z.strictObject({});
+/**
+ * The approver is the authenticated approval principal (audit M9). A plan built from lessons with
+ * flagged instructions needs `acknowledgeUntrusted: true`, as a flagged spec does.
+ */
+const Approve = z.strictObject({ acknowledgeUntrusted: z.boolean().optional() });
 const Revise = z.strictObject({ tasks: z.array(PlanTaskSchema).min(1).max(200) });
 const ListQuery = z.object({
   projectId: z.string().min(1).optional(),
@@ -40,8 +44,11 @@ export function planRoutes(
     return plan;
   };
   const versions = (p: Plan) => f.planner.listLineage(p.lineageId).map(versionOf);
-  const harnessesFor = (projectId: string) =>
-    f.harnesses(s.knowledge.projects.get(projectId)?.repoPath);
+  // A project whose execution profile has checks is planned against its generated harness.
+  const harnessesFor = (projectId: string) => {
+    const project = s.knowledge.projects.get(projectId);
+    return f.harnesses(project?.repoPath, project ? profileHarness(project) : null);
+  };
 
   app.post("/v1/plans/propose", async (req, reply) => {
     const body = parseBody(Propose, req.body);
@@ -51,9 +58,26 @@ export function planRoutes(
     // Preflight: the planner reports an unreachable harness service as "no resolvable harness"
     // (422); asking it for its harnesses first surfaces `not_wired` as 503 brokkr_unavailable.
     await service.listHarnesses();
+    const project = s.knowledge.projects.get(spec.projectId);
+    const rework = s.rework.forLineage(spec.lineageId);
+    // Exporting a snapshot is only worth it for a provider that will read it.
+    const provider = f.provider();
+    const workspace =
+      project && provider.readsWorkspace
+        ? await s.planningWorkspace(
+            project,
+            rework?.baseCommits[0]
+              ? { commit: rework.baseCommits[0], alsoStartsFrom: rework.baseCommits.slice(1) }
+              : {},
+          )
+        : undefined;
     const plan = await f.planner.propose(
       { id: spec.id },
-      { provider: f.provider(), harnesses: service },
+      {
+        provider,
+        harnesses: service,
+        ...(workspace ? { workspace: workspace.path, workspaceLabel: workspace.label } : {}),
+      },
     );
     return reply.code(201).send({ plan, versions: versions(plan), harnessSource: source });
   });
@@ -95,8 +119,12 @@ export function planRoutes(
   app.post<IdParams>("/v1/plans/:id/approve", (req) => {
     const approver = approvals.require(req);
     requirePlan(req.params.id);
-    parseBody(Approve, req.body);
-    return { plan: f.planner.approve(req.params.id, approver) };
+    const body = parseBody(Approve, req.body);
+    return {
+      plan: f.planner.approve(req.params.id, approver, {
+        ...(body.acknowledgeUntrusted ? { acknowledgeUntrusted: true } : {}),
+      }),
+    };
   });
 
   app.post<IdParams>("/v1/plans/:id/revise", async (req, reply) => {

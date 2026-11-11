@@ -71,8 +71,50 @@ export {
   type InjectionFinding,
   type InjectionPattern,
 } from "./untrusted.js";
-export { classifySystem, dataRules, DRAFT_INSTRUCTIONS, draftSpecSystem } from "./prompts.js";
+export {
+  classifySystem,
+  dataRules,
+  DRAFT_INSTRUCTIONS,
+  draftSpecSystem,
+  WORKSPACE_CONTEXT_ID,
+} from "./prompts.js";
+export {
+  lessonBlockText,
+  lessonCitationId,
+  LESSON_CITATION_PREFIX,
+  LESSONS_RULE,
+  loadLessons,
+  MAX_PROMPT_LESSONS,
+  UPSTREAM_REDACTED_PATTERN,
+  type ExternalLesson,
+  type LessonContext,
+  type LessonsFor,
+  type LoadedLessons,
+} from "./lessons.js";
 export { estimateCost, listRuns, MODEL_PRICES, recordRun, type DirectorRun } from "./runs.js";
 export { DIRECTOR_MIGRATIONS } from "./schema.js";
 
 export { CliProvider, type CliProviderKind, type CliProviderOptions } from "./providers/cli.js";
+export {
+  askGuide,
+  buildGuidePrompt,
+  createMemoryDocs,
+  EMPTY_DOCS,
+  GUIDE_APPS,
+  GUIDE_DOCS_ABSENT_NOTE,
+  GUIDE_SCREENS,
+  guideSystem,
+  renderGuideState,
+  type DocHit,
+  type DocsSource,
+  type GlossaryEntry,
+  type GuideAnswer,
+  type GuideApp,
+  type GuideContext,
+  type GuideCountedItem,
+  type GuideLink,
+  type GuidePrompt,
+  type GuideProjectState,
+  type GuideState,
+} from "./guide.js";
+export { createFactoryDocs } from "./factory-docs.js";

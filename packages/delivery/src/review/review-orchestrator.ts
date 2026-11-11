@@ -431,7 +431,12 @@ export class ReviewOrchestrator implements ReviewVerdictSource {
       verdict: blocking ? "request_changes" : file.verdict,
       reason: blocking ? `${blocking}_finding` : null,
       artifactId: artifact.artifactId,
-      file,
+      // A shared review file also assesses other tasks' criteria; this record keeps its own
+      // task's, which is what the review gate checks it against.
+      file: {
+        ...file,
+        acceptance: file.acceptance.filter((a) => criteria.includes(a.criterionId)),
+      },
     });
   }
 

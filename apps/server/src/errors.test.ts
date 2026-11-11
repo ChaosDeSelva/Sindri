@@ -4,7 +4,7 @@ import { SindriError } from "@sindri/knowledge";
 import { SpecStateError, SpecValidationError } from "@sindri/specs";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ApiError, toApiError } from "./errors.js";
+import { ApiError, parseBody, toApiError } from "./errors.js";
 
 const map = (e: unknown) => {
   const a = toApiError(e);
@@ -41,6 +41,25 @@ describe("toApiError maps typed errors by code, never by message text", () => {
     ]);
   });
 
+  it("says why a provider failed and passes on what it reported", () => {
+    const auth = toApiError(
+      new ProviderError("auth", "not signed in", { detail: "Invalid API key · Please run /login" }),
+    );
+    expect([auth.status, auth.code]).toEqual([503, "provider_unavailable"]);
+    expect(auth.message).toMatch(/^LLM provider unavailable \(auth\): .*sign in/);
+    expect(auth.details).toEqual({ reason: "Invalid API key · Please run /login" });
+    expect(toApiError(new ProviderError("rate_limited", "x")).message).toMatch(
+      /\(rate_limited\): .*limit/,
+    );
+    const timeout = toApiError(new ProviderError("timeout", "x"));
+    expect([timeout.status, timeout.code]).toEqual([503, "provider_error"]);
+    expect(timeout.message).toMatch(/\(timeout\): .*time limit/);
+    expect(timeout.details).toBeUndefined();
+    expect(toApiError(new ProviderError("api_error", "x")).message).toBe(
+      "LLM provider error (api_error)",
+    );
+  });
+
   it("maps Zod and Fastify client errors to 422", () => {
     const zerr = z.object({ a: z.string() }).safeParse({}).error;
     expect(map(zerr)[0]).toBe(422);
@@ -61,5 +80,36 @@ describe("toApiError maps typed errors by code, never by message text", () => {
       "a string",
     ])
       expect(map(e)).toEqual([500, "internal", "internal error"]);
+  });
+});
+
+describe("toApiError: Fastify request errors", () => {
+  const fst = (statusCode: number, code = "FST_ERR_X") =>
+    Object.assign(new Error("fastify"), { statusCode, code });
+
+  it("names an unsupported media type and an oversized body", () => {
+    expect(map(fst(415, "FST_ERR_CTP_INVALID_MEDIA_TYPE"))).toEqual([
+      422,
+      "validation_failed",
+      "unsupported content type",
+    ]);
+    expect(map(fst(413, "FST_ERR_CTP_BODY_TOO_LARGE"))).toEqual([
+      422,
+      "validation_failed",
+      "payload too large",
+    ]);
+  });
+
+  it("treats a Fastify server-side error, or a non-numeric status, as internal", () => {
+    expect(map(fst(500))[0]).toBe(500);
+    expect(map(Object.assign(new Error("x"), { statusCode: "400", code: "FST_ERR_X" }))[0]).toBe(
+      500,
+    );
+    expect(map(Object.assign(new Error("x"), { statusCode: 400, code: 7 }))[0]).toBe(500);
+  });
+
+  it("parseBody treats a missing body as an empty object", () => {
+    expect(parseBody(z.object({ a: z.string().optional() }), undefined)).toEqual({});
+    expect(() => parseBody(z.object({ a: z.string() }), null)).toThrow(ApiError);
   });
 });

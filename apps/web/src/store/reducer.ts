@@ -1,18 +1,26 @@
 import type { Project } from "../api/types.js";
 
+/**
+ * Hash-routed screens. Project tabs (top bar): overview … project-settings. Global pages (bottom
+ * bar): projects, harnesses, autonomy-all, settings, docs. Ids match `@factory/docs` NAV.
+ */
 export type View =
-  | "projects"
+  | "overview"
   | "inbox"
   | "director"
   | "specs"
-  | "knowledge"
-  | "settings"
   | "plans"
-  | "harnesses"
   | "runs"
-  | "reviews"
-  | "deliveries";
-export type Theme = "light" | "dark";
+  | "needs-you"
+  | "deliveries"
+  | "knowledge"
+  | "autonomy"
+  | "project-settings"
+  | "projects"
+  | "harnesses"
+  | "autonomy-all"
+  | "settings"
+  | "docs";
 export interface Notice {
   kind: "info" | "error";
   text: string;
@@ -21,7 +29,6 @@ export interface Notice {
 export interface State {
   token: string | null;
   view: View;
-  theme: Theme;
   projects: Project[];
   projectId: string | null;
   /** Spec selected in the specs view. */
@@ -30,6 +37,11 @@ export interface State {
   planId: string | null;
   executionId: string | null;
   deliveryId: string | null;
+  /** Docs page slug and heading anchor (`#/docs/<slug>?section=<anchor>`). */
+  docsSlug: string | null;
+  docsSection: string | null;
+  /** Inbox item handed to the Director ("Draft spec from this"); the Director consumes it. */
+  directorSeed: { intakeId: string; request: string } | null;
   notice: Notice | null;
 }
 
@@ -46,27 +58,41 @@ export type Action =
   | { type: "plan/open"; planId: string }
   | { type: "execution/open"; executionId: string }
   | { type: "delivery/open"; deliveryId: string }
+  | { type: "director/open"; intakeId: string; request: string }
+  | { type: "director/seed-used" }
   | {
       type: "route";
       route: Partial<
-        Pick<State, "view" | "projectId" | "specId" | "planId" | "executionId" | "deliveryId">
+        Pick<
+          State,
+          | "view"
+          | "projectId"
+          | "specId"
+          | "planId"
+          | "executionId"
+          | "deliveryId"
+          | "docsSlug"
+          | "docsSection"
+        >
       >;
     }
+  | { type: "docs/open"; slug: string; section?: string | null }
   | { type: "notice"; notice: Notice }
-  | { type: "notice/dismiss" }
-  | { type: "theme/toggle" };
+  | { type: "notice/dismiss" };
 
-export function initialState(init: { token?: string | null; theme?: Theme }): State {
+export function initialState(init: { token?: string | null }): State {
   return {
     token: init.token ?? null,
-    view: "projects",
-    theme: init.theme ?? "light",
+    view: "overview",
     projects: [],
     projectId: null,
     specId: null,
     planId: null,
     executionId: null,
     deliveryId: null,
+    docsSlug: null,
+    docsSection: null,
+    directorSeed: null,
     notice: null,
   };
 }
@@ -91,18 +117,32 @@ export function reducer(state: State, action: Action): State {
     case "navigate":
       return { ...state, view: action.view, notice: keepErrors(state.notice) };
     case "route":
-      return { ...state, ...action.route, notice: keepErrors(state.notice) };
+      // A hash that names no project (`#/plans`) changes the view, not the project.
+      return {
+        ...state,
+        ...action.route,
+        projectId: action.route.projectId ?? state.projectId,
+        notice: keepErrors(state.notice),
+      };
     case "project/select":
-      return { ...state, projectId: action.projectId, specId: null, ...NO_SELECTION };
-    case "projects/loaded":
+      return {
+        ...state,
+        projectId: action.projectId,
+        specId: null,
+        directorSeed: null,
+        ...NO_SELECTION,
+      };
+    case "projects/loaded": {
+      if (state.projectId && action.projects.some((p) => p.id === state.projectId))
+        return { ...state, projects: action.projects };
+      // The project is gone (or none was chosen): its selections must not open in the next one.
       return {
         ...state,
         projects: action.projects,
-        projectId:
-          state.projectId && action.projects.some((p) => p.id === state.projectId)
-            ? state.projectId
-            : (action.projects[0]?.id ?? null),
+        projectId: action.projects[0]?.id ?? null,
+        ...(state.projectId ? { specId: null, directorSeed: null, ...NO_SELECTION } : {}),
       };
+    }
     case "projects/upsert": {
       const exists = state.projects.some((p) => p.id === action.project.id);
       return {
@@ -142,11 +182,26 @@ export function reducer(state: State, action: Action): State {
         deliveryId: action.deliveryId,
         notice: keepErrors(state.notice),
       };
+    case "director/open":
+      return {
+        ...state,
+        view: "director",
+        directorSeed: { intakeId: action.intakeId, request: action.request },
+        notice: keepErrors(state.notice),
+      };
+    case "docs/open":
+      return {
+        ...state,
+        view: "docs",
+        docsSlug: action.slug,
+        docsSection: action.section ?? null,
+        notice: keepErrors(state.notice),
+      };
+    case "director/seed-used":
+      return { ...state, directorSeed: null };
     case "notice":
       return { ...state, notice: action.notice };
     case "notice/dismiss":
       return { ...state, notice: null };
-    case "theme/toggle":
-      return { ...state, theme: state.theme === "dark" ? "light" : "dark" };
   }
 }

@@ -25,8 +25,14 @@ import {
   type Specs,
 } from "@sindri/specs";
 import { z } from "zod";
+import { loadLessons, type LessonsFor } from "./lessons.js";
 import { nullLogger, type Logger } from "./logger.js";
-import { classifySystem, DRAFT_INSTRUCTIONS, draftSpecSystem } from "./prompts.js";
+import {
+  classifySystem,
+  DRAFT_INSTRUCTIONS,
+  draftSpecSystem,
+  WORKSPACE_CONTEXT_ID,
+} from "./prompts.js";
 import {
   ProviderError,
   type CompleteRequest,
@@ -76,14 +82,21 @@ export const DraftOutputSchema = z.strictObject({
     }),
   ),
   openQuestions: z.array(
-    z.strictObject({ id: z.string(), text: z.string(), blocking: z.boolean() }),
+    z.strictObject({
+      id: z.string(),
+      text: z.string(),
+      blocking: z.boolean(),
+      /** Empty when the drafter has no grounded suggestion. */
+      recommendation: z.string(),
+      rationale: z.string(),
+    }),
   ),
 });
 export type DraftOutput = z.infer<typeof DraftOutputSchema>;
 
 // -------------------------------------------------------------------------------- types
 
-export type ContextKind = "chunk" | "adr" | "knowledge" | "decision" | "intake" | "repo";
+export type ContextKind = "chunk" | "adr" | "knowledge" | "decision" | "intake" | "repo" | "lesson";
 
 export interface ContextItem {
   /** Citation id the model must use, e.g. `chunk:12`, `knowledge:<uuid>`. */
@@ -134,12 +147,17 @@ export interface DirectorSpecMeta {
   unverifiedClaims: UnverifiedClaim[];
   /** Acceptance criteria cited only by decisions; their provenance falls back to the intake. */
   decisionOnlyAcceptanceCriteria: string[];
+  /** Acceptance criteria with no spec ref but a lesson citation, by id: the `fg:` ids cited. */
+  lessonOnlyAcceptanceCriteria: Record<string, string[]>;
   classification: Classification | null;
   contextIds: string[];
   model: string | null;
   runId: string | null;
   answers: AnswerRecord[];
-  /** Secrets redacted from ticket and request text before prompting (ticket text is not changed). */
+  /**
+   * Secrets redacted from ticket and request text before prompting (ticket text is not changed)
+   * and from the drafted text before it was stored.
+   */
   secretsRedacted: number;
 }
 
@@ -149,6 +167,13 @@ export interface DraftSpecInput {
   request: string;
   /** Skip the classify call when the caller already classified the request. */
   classification?: Classification;
+  /**
+   * Commit the drafter should read instead of the default branch: a rework is drafted against
+   * the delivered change it revises.
+   */
+  workspaceCommit?: string;
+  /** Further commits the work starts from that `workspaceCommit`'s tree does not contain. */
+  workspaceAlsoStartsFrom?: readonly string[];
 }
 
 export interface DraftSpecResult {
@@ -165,6 +190,16 @@ export interface OpenDirectorOptions {
   /** Max search chunks in the context (ADR chunks are counted separately). Default 8. */
   topK?: number;
   maxTokens?: number;
+  /**
+   * Where the provider may read a project's code while drafting; a server passes a snapshot of
+   * the default branch. Without it the provider answers from the supplied context alone.
+   */
+  workspaceFor?: (
+    project: { id: string; repoPath: string },
+    opts?: { commit?: string; alsoStartsFrom?: readonly string[] },
+  ) => Promise<{ path: string; label?: string } | undefined>;
+  /** The project's approved Feedback Graph lessons, cited `fg:<id>`; failures mean none. */
+  lessonsFor?: LessonsFor;
 }
 
 export class DirectorError extends SindriError {
@@ -242,30 +277,66 @@ export function openDirector(pathOrDb: string | SqliteDatabase, options: OpenDir
   const topK = options.topK ?? 8;
   const maxTokens = options.maxTokens ?? 16000;
 
+  const recordFailure = (projectId: string | null, purpose: string, e: unknown) => {
+    // Every provider call is accounted for, including failed validation and refusals.
+    const pe = e instanceof ProviderError ? e : null;
+    recordRun(
+      db,
+      {
+        projectId,
+        purpose,
+        model: pe?.model ?? provider.name,
+        usage: pe?.usage ?? null,
+        outcome: pe?.code ?? "error",
+      },
+      iso(),
+    );
+    log.warn("director.llm.failed", {
+      purpose,
+      projectId,
+      code: pe?.code ?? "error",
+      ...(pe?.detail ? { detail: pe.detail } : {}),
+    });
+  };
+
+  /** Where the provider may read the project's code for this draft, if anywhere. */
+  const draftWorkspace = async (
+    projectId: string,
+    commit?: string,
+    alsoStartsFrom?: readonly string[],
+  ) => {
+    const project = knowledge.projects.get(projectId);
+    // Exporting a snapshot is only worth it for a provider that will read it.
+    if (!project || !options.workspaceFor || !provider.readsWorkspace) return undefined;
+    try {
+      return await options.workspaceFor(
+        { id: project.id, repoPath: project.repoPath },
+        commit ? { commit, alsoStartsFrom: alsoStartsFrom ?? [] } : {},
+      );
+    } catch (e) {
+      recordFailure(projectId, "draft_spec", e);
+      throw e;
+    }
+  };
+
+  // Classification is a quick label; only drafting is worth a read of the repository.
   const call = async <T>(
     projectId: string | null,
     purpose: string,
     req: Omit<CompleteRequest<T>, "metadata">,
+    workspace?: { path: string; label?: string },
   ) => {
     log.info("director.llm", { purpose, provider: provider.name, projectId });
     let res: CompleteResult<T>;
     try {
-      res = await provider.complete<T>({ ...req, metadata: { purpose } });
+      res = await provider.complete<T>({
+        ...req,
+        metadata: { purpose },
+        ...(workspace ? { workspace: workspace.path } : {}),
+        ...(workspace?.label ? { workspaceLabel: workspace.label } : {}),
+      });
     } catch (e) {
-      // Every provider call is accounted for, including failed validation and refusals.
-      const pe = e instanceof ProviderError ? e : null;
-      recordRun(
-        db,
-        {
-          projectId,
-          purpose,
-          model: pe?.model ?? provider.name,
-          usage: pe?.usage ?? null,
-          outcome: pe?.code ?? "error",
-        },
-        iso(),
-      );
-      log.warn("director.llm.failed", { purpose, projectId, code: pe?.code ?? "error" });
+      recordFailure(projectId, purpose, e);
       throw e;
     }
     if (res.parsed === undefined) {
@@ -310,6 +381,7 @@ export function openDirector(pathOrDb: string | SqliteDatabase, options: OpenDir
     injectionFindings: [],
     unverifiedClaims: [],
     decisionOnlyAcceptanceCriteria: [],
+    lessonOnlyAcceptanceCriteria: {},
     classification: null,
     contextIds: [],
     model: null,
@@ -510,6 +582,8 @@ export function openDirector(pathOrDb: string | SqliteDatabase, options: OpenDir
       };
       const ticket = { title: redact(rec.title), body: redact(rec.body) };
       const request = redact(input.request);
+      // Started now so the lesson fetch overlaps classify and the workspace; never rejects.
+      const lessonsLoad = loadLessons(options.lessonsFor, projectId);
 
       // 2. Classify, load cited context, analyse the repo.
       const classification = input.classification ?? (await api.classify(request, { projectId }));
@@ -550,6 +624,29 @@ export function openDirector(pathOrDb: string | SqliteDatabase, options: OpenDir
           text: analysis.structure,
           ref: { documentId: analysis.structureDocumentId },
         });
+      // What the model reads in the repository has no block of its own to cite, so the
+      // repository gets one: without it every claim taken from the code would be demoted to an
+      // unverified assumption. Only when this provider is really given the files.
+      const workspace = await draftWorkspace(
+        projectId,
+        input.workspaceCommit,
+        input.workspaceAlsoStartsFrom,
+      );
+      const repository = Boolean(workspace && provider.readsWorkspace);
+      if (repository)
+        items.push({
+          id: WORKSPACE_CONTEXT_ID,
+          kind: "repo",
+          title: "project repository",
+          text: `The project repository at the working directory.${workspace?.label ? ` ${workspace.label}` : ""} Cite this id for a claim taken from a file you read there, and name the file path in the claim.`,
+          ref: null,
+        });
+      // Lessons arrive redacted (the scan below skips them), but their injection findings,
+      // including ones redacted at source, still flag the spec.
+      const lessons = await lessonsLoad;
+      findings.push(...lessons.findings);
+      for (const l of lessons.lessons)
+        items.push({ id: l.id, kind: "lesson", title: l.title, text: l.text, ref: null });
       // Audit M7: repo-derived items with secret material never reach the provider.
       for (let i = items.length - 1; i >= 0; i--) {
         const it = items[i]!;
@@ -558,7 +655,7 @@ export function openDirector(pathOrDb: string | SqliteDatabase, options: OpenDir
       // Repo-derived text (chunks, ADRs, knowledge, test commands, structure) is untrusted too,
       // including titles (file paths), which travel as block attributes.
       for (const it of items)
-        if (it.kind !== "intake") {
+        if (it.kind !== "intake" && it.kind !== "lesson") {
           scan(it.text, it.id);
           scan(it.title, it.id);
         }
@@ -588,21 +685,34 @@ export function openDirector(pathOrDb: string | SqliteDatabase, options: OpenDir
         parsed: draft,
         model,
         run,
-      } = await call(projectId, "draft_spec", {
-        system: draftSpecSystem(nonce),
-        messages: [
-          {
-            role: "user",
-            content: `${DRAFT_INSTRUCTIONS}\n\n${summaryBlock}\n\n${blocks.join("\n\n")}`,
-          },
-        ],
-        maxTokens,
-        temperature: 0,
-        responseSchema: DraftOutputSchema,
-      });
+      } = await call(
+        projectId,
+        "draft_spec",
+        {
+          system: draftSpecSystem(nonce, {
+            repository,
+            lessons: items.some((i) => i.kind === "lesson"),
+          }),
+          messages: [
+            {
+              role: "user",
+              content: `${DRAFT_INSTRUCTIONS}\n\n${summaryBlock}\n\n${blocks.join("\n\n")}`,
+            },
+          ],
+          maxTokens,
+          temperature: 0,
+          responseSchema: DraftOutputSchema,
+        },
+        workspace,
+      );
 
       // 4. Resolve citations deterministically; uncited or unknown-cited claims become assumptions.
-      const clean = (s: string) => redactInjections(s.trim());
+      // The drafter reads files, so its text is scanned for secrets like any other repo text.
+      const clean = (s: string) => {
+        const r = redactSecrets(s.trim());
+        secretsRedacted += r.count;
+        return redactInjections(r.text);
+      };
       const unverified: UnverifiedClaim[] = [];
       const assumptions: SpecBody["assumptions"] = draft.assumptions
         .map((a) => ({ text: clean(a.text), risk: a.risk }))
@@ -657,6 +767,7 @@ export function openDirector(pathOrDb: string | SqliteDatabase, options: OpenDir
       const acceptanceCriteria: SpecBody["acceptanceCriteria"] = [];
       const acProv: Record<string, ProvenanceRef[]> = {};
       const decisionOnly: string[] = [];
+      const lessonOnly: Record<string, string[]> = {};
       for (const ac of draft.acceptanceCriteria) {
         const text = clean(ac.text);
         if (!text) continue;
@@ -668,11 +779,27 @@ export function openDirector(pathOrDb: string | SqliteDatabase, options: OpenDir
         }
         acceptanceCriteria.push({ id: ac.id.trim(), text, verification: ac.verification });
         // Decisions are citable but specs cannot reference them; flag the borrowed intake ref.
-        if (!r.refs.length) decisionOnly.push(ac.id.trim());
+        // (The repository has no spec ref either, but a file read is not a decision.)
+        if (!r.refs.length && ac.citations.some((c) => byId.get(c)?.kind === "decision"))
+          decisionOnly.push(ac.id.trim());
+        // Lessons have no spec ref either: name the lessons behind the borrowed intake ref.
+        const cited = ac.citations.filter((c) => byId.get(c)?.kind === "lesson");
+        if (!r.refs.length && cited.length) lessonOnly[ac.id.trim()] = [...new Set(cited)];
         acProv[ac.id.trim()] = r.refs.length ? dedupeRefs(r.refs) : [intakeRef];
       }
       const openQuestions: OpenQuestion[] = draft.openQuestions
-        .map((q) => ({ id: q.id.trim(), text: clean(q.text), blocking: q.blocking }))
+        .map((q) => {
+          const recommendation = clean(q.recommendation);
+          const rationale = clean(q.rationale);
+          return {
+            id: q.id.trim(),
+            text: clean(q.text),
+            blocking: q.blocking,
+            // A reason without a suggestion has nothing to explain.
+            ...(recommendation ? { recommendation } : {}),
+            ...(recommendation && rationale ? { rationale } : {}),
+          };
+        })
         .filter((q) => q.text);
 
       const body: SpecBody = {
@@ -695,11 +822,13 @@ export function openDirector(pathOrDb: string | SqliteDatabase, options: OpenDir
         openQuestions: openQuestions.length ? [intakeRef] : [],
         acceptanceCriteria: acProv,
       };
+      const title = clean(draft.title) || clean(ticket.title) || "Untitled specification";
       const meta: DirectorSpecMeta = {
         untrustedInstructionDetected: findings.length > 0,
         injectionFindings: findings,
         unverifiedClaims: unverified,
         decisionOnlyAcceptanceCriteria: decisionOnly,
+        lessonOnlyAcceptanceCriteria: lessonOnly,
         classification,
         contextIds: items.map((i) => i.id),
         model,
@@ -707,7 +836,6 @@ export function openDirector(pathOrDb: string | SqliteDatabase, options: OpenDir
         answers: [],
         secretsRedacted,
       };
-      const title = clean(draft.title) || clean(ticket.title) || "Untitled specification";
       let spec: Specification;
       try {
         spec = db.transaction(() => {
