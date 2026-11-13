@@ -60,6 +60,8 @@ export interface MimirClientFacadeOptions {
   agentKindFor?: AgentKindResolver;
   /** Per-role crew concurrency, merged over the planner's `DEFAULT_CONCURRENCY`. */
   concurrency?: Partial<Record<Role, number>>;
+  /** Read per plan: local-only mode refuses a plan that needs the web. */
+  localOnly?: () => boolean;
   /**
    * The Mimir project settings Sindri owns for a repository (agent environment, verification
    * timeout); undefined leaves the Mimir project's settings alone. Default: derived from the
@@ -150,12 +152,18 @@ export class MimirClientFacade {
   /**
    * The Mimir project for `repoPath`, created once (idempotently) when missing. The settings
    * Sindri owns (`projectSettingsFor`) go into a new project and are brought up to date on an
-   * existing one.
+   * existing one. `name` names a new project (default: the folder name). `profileOf` takes the
+   * owned settings from another repository's project instead (a PR review mirror runs with the
+   * execution profile of the project it mirrors).
    */
-  async ensureProject(repoPath: string, settings: Record<string, unknown> = {}): Promise<Project> {
+  async ensureProject(
+    repoPath: string,
+    settings: Record<string, unknown> = {},
+    { name, profileOf }: { name?: string; profileOf?: string } = {},
+  ): Promise<Project> {
     const owned = (
       this.options.projectSettingsFor ?? ((p: string) => profileSettingsFromDb(this.db, p))
-    )(repoPath);
+    )(profileOf ?? repoPath);
     if (owned) settings = { ...settings, ...owned };
     // Mimir records canonical git roots; macOS temp paths commonly contain symlinks.
     try {
@@ -172,7 +180,7 @@ export class MimirClientFacade {
     this.db.prepare("DELETE FROM mimir_submissions WHERE idempotency_key = ?").run(key);
     const { project } = await this.submit("project", key, async () => {
       const res = await this.sdk.projects.create(
-        { name: basename(repoPath) || repoPath, repoPath, settings },
+        { name: name ?? (basename(repoPath) || repoPath), repoPath, settings },
         { idempotencyKey: key },
       );
       return { id: res.project.id, value: res };
@@ -251,6 +259,7 @@ export class MimirClientFacade {
         ...(this.options.agentKindFor ? { agentKindFor: this.options.agentKindFor } : {}),
         ...(this.options.concurrency ? { concurrency: this.options.concurrency } : {}),
         ...(run !== undefined ? { run } : {}),
+        ...(this.options.localOnly ? { localOnly: this.options.localOnly() } : {}),
       });
     } catch (err) {
       throw new MimirClientError("invalid_plan", (err as Error).message);
@@ -264,8 +273,7 @@ export class MimirClientFacade {
         {
           projectId: projectId as ProjectId,
           objective: mapped.objective,
-          // `baseCommits` is newer than the vendored @mimir/protocol types; the server accepts it.
-          ...(baseCommits?.length ? ({ baseCommits: [...baseCommits] } as object) : {}),
+          ...(baseCommits?.length ? { baseCommits: [...baseCommits] } : {}),
         },
         { idempotencyKey: mapped.missionIdempotencyKey },
       );
@@ -322,6 +330,7 @@ export class MimirClientFacade {
               ? { acceptanceCriteria: task.acceptanceCriteria }
               : {}),
             dependsOn: task.dependsOn.map((d) => taskIdMap[d] as TaskId),
+            ...(task.mode ? { mode: task.mode } : {}),
           },
           { idempotencyKey: task.idempotencyKey },
         );
@@ -516,6 +525,7 @@ export class MimirClientFacade {
     );
   }
 
+  /** Artifact metadata. */
   async getArtifact(artifactId: ArtifactId | string): Promise<Artifact> {
     return (await this.sdk.artifacts.get(artifactId as ArtifactId)).artifact;
   }
