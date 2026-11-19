@@ -463,7 +463,7 @@ export function deliveryRoutes(
 
   const updater = async (executionId: string) => {
     requireDelivered(executionId);
-    const report = await withMimir(() => delivery.report(executionId));
+    const report = await withMimir(() => delivery.report(executionId, { preferDelivered: true }));
     return {
       report,
       service: new KnowledgeUpdater({
@@ -474,8 +474,8 @@ export function deliveryRoutes(
     };
   };
   app.get<{ Params: { id: string } }>("/v1/deliveries/:id/proposals", async (req) => {
-    const { report, service } = await updater(req.params.id);
-    return { proposals: service.list(report.id) };
+    const { service } = await updater(req.params.id);
+    return { proposals: service.listForExecution(req.params.id) };
   });
   app.post<{ Params: { id: string } }>("/v1/deliveries/:id/proposals", async (req) => {
     approvals.require(req);
@@ -493,8 +493,8 @@ export function deliveryRoutes(
         }),
         req.body,
       );
-      const { report, service } = await updater(req.params.id);
-      if (!service.list(report.id).some((p) => p.id === req.params.proposalId))
+      const { service } = await updater(req.params.id);
+      if (!service.listForExecution(req.params.id).some((p) => p.id === req.params.proposalId))
         throw notFound("proposal");
       return {
         proposal:

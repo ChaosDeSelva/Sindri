@@ -125,4 +125,12 @@ export const DELIVERY_MIGRATIONS: readonly string[] = [
   );
   CREATE INDEX executions_project ON executions(project_id);
   `,
+  `CREATE TABLE execution_decision_snapshots (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL,
+    plan_version INTEGER NOT NULL,
+    run_number INTEGER NOT NULL,
+    entries_json TEXT NOT NULL,
+    PRIMARY KEY(project_id, plan_id, plan_version, run_number)
+  );`,
 ];
