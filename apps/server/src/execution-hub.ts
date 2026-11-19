@@ -337,12 +337,20 @@ export class ExecutionHub {
         return (JSON.parse(row.body_json) as { acceptanceCriteria: { id: string; text: string }[] })
           .acceptanceCriteria;
       },
-      agentKindFor: (_harness: string, role: string) => {
+      agentKindFor: (_harness: string, role: string, workKind?: string) => {
         const st = this.#o.settings.get();
-        return ["reviewer", "qa", "security"].includes(role)
+        // A proposal's writer plans rather than implements: it runs on the agent that plans and
+        // reviews (Claude by default), not on the implementing one.
+        const plans = workKind === "proposal" && role === "docs";
+        return plans || ["reviewer", "qa", "security"].includes(role)
           ? (st.reviewerAgent ?? "claude")
           : (st.workerAgent ?? "claude");
       },
+      // Claude Code and Codex stand in for each other while one cannot work.
+      fallbackAgentFor: (kind: string) =>
+        this.#o.settings.get().fallbackAgent === false
+          ? undefined
+          : ({ claude: "codex", codex: "claude" } as Record<string, string>)[kind],
       localOnly: () => this.#o.settings.get().localOnly,
       ...(this.#o.mimirFetch ? { fetch: this.#o.mimirFetch } : {}),
       ...(this.#o.now ? { now: this.#o.now } : {}),

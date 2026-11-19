@@ -1,5 +1,9 @@
 import {
+  detectProjects,
+  MAX_CONTEXT_DOCUMENTS,
   MAX_FIELD_CHARS,
+  MAX_PROPOSAL_REFERENCES,
+  MAX_PROPOSAL_TEXT_CHARS,
   MAX_REQUEST_SKILLS,
   parsePullRequestUrl,
   pullRequestOfSnapshot,
@@ -13,6 +17,7 @@ import { z } from "zod";
 import { DISPLAY_SANITIZED, forDisplay } from "../display.js";
 import { ApiError, notFound, parseBody } from "../errors.js";
 import { cachedRemoteLookup } from "../review-mirror.js";
+import { requireContextFiles } from "./context-files.js";
 import type { Services } from "../services.js";
 
 /**
@@ -60,7 +65,10 @@ export function intakeView(r: IntakeRecord) {
       notes: r.notes,
       skillIds: r.skillIds,
       research: r.research,
+      proposal: r.proposal,
       linkedExecutionId: r.linkedExecutionId,
+      contextExecutionIds: r.contextExecutionIds,
+      contextFileIds: r.contextFileIds,
       pullRequest: pullRequestView(r),
     }),
     title: r.display.title,
@@ -89,6 +97,8 @@ const sanitized = { config: { [DISPLAY_SANITIZED]: true } };
 /** Work kind and operator guidance a new intake may carry. */
 const WorkFields = {
   workKind: z.enum(WORK_KINDS).optional(),
+  contextExecutionIds: z.array(z.string().min(1).max(200)).max(MAX_CONTEXT_DOCUMENTS).optional(),
+  contextFileIds: z.array(z.string().min(1).max(200)).max(MAX_CONTEXT_DOCUMENTS).optional(),
   notes: utf8Capped(MAX_REQUEST_NOTES_BYTES, "notes").optional(),
   skillIds: z.array(z.string().min(1).max(100)).max(MAX_REQUEST_SKILLS).optional(),
   research: z
@@ -103,15 +113,36 @@ const WorkFields = {
       factCheck: z.boolean().optional(),
     })
     .optional(),
+  proposal: z
+    .strictObject({
+      referenceProjectIds: z
+        .array(z.string().min(1).max(200))
+        .max(MAX_PROPOSAL_REFERENCES)
+        .optional(),
+      sources: z
+        .strictObject({ code: z.boolean().optional(), web: z.boolean().optional() })
+        .optional(),
+      factCheck: z.boolean().optional(),
+    })
+    .optional(),
 };
 
-const ManualIntake = z.strictObject({
-  projectId: z.string().min(1),
-  title: z.string().trim().min(1).max(500),
-  // Same cap as connector imports (review m6).
-  body: z.string().max(MAX_FIELD_CHARS),
-  ...WorkFields,
-});
+const ManualIntake = z
+  .strictObject({
+    projectId: z.string().min(1),
+    title: z.string().trim().min(1).max(500),
+    // Same cap as connector imports (review m6); a plan's pasted text may be longer (below).
+    body: z.string().max(MAX_PROPOSAL_TEXT_CHARS),
+    ...WorkFields,
+  })
+  .superRefine((v, ctx) => {
+    if (v.workKind !== "proposal" && v.body.length > MAX_FIELD_CHARS)
+      ctx.addIssue({
+        code: "custom",
+        path: ["body"],
+        message: `at most ${MAX_FIELD_CHARS} characters (a plan's text may be up to ${MAX_PROPOSAL_TEXT_CHARS})`,
+      });
+  });
 
 const ImportIntake = z.strictObject({
   // Optional for a GitHub pull request: the project whose remote is that repository is used.
@@ -120,15 +151,46 @@ const ImportIntake = z.strictObject({
   ...WorkFields,
 });
 
+/**
+ * 422 unless every run named as context delivered a document someone accepted: only accepted
+ * plans and research are handed to agents as context.
+ */
+export function requireAcceptedDocuments(
+  s: Pick<Services, "db">,
+  ids: readonly string[] | undefined,
+) {
+  if (!ids?.length) return;
+  const has = s.db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'document_decisions'")
+    .get();
+  const accepted = (id: string) =>
+    has &&
+    s.db
+      .prepare("SELECT 1 FROM document_decisions WHERE execution_id = ? AND decision = 'accepted'")
+      .get(id);
+  const missing = [...new Set(ids)].filter((id) => !accepted(id));
+  if (missing.length)
+    throw new ApiError(
+      422,
+      "validation_failed",
+      "context documents must be accepted plans or research documents",
+      { missing },
+    );
+}
+
 /** 422 `local_only` for a research request that asks for the web while local-only mode is on. */
 export function refuseLocalOnlyWeb(
   s: Pick<Services, "settings">,
   work: {
     workKind?: string | undefined;
     research?: { sources?: { web?: boolean | undefined } | undefined } | undefined;
+    proposal?: { sources?: { web?: boolean | undefined } | undefined } | undefined;
   },
 ) {
-  if (work.workKind === "research" && work.research?.sources?.web && s.settings.get().localOnly)
+  const web =
+    (work.workKind === "research" && work.research?.sources?.web) ||
+    (work.workKind === "proposal" && work.proposal?.sources?.web);
+  if (web && s.settings.get().localOnly)
     throw new ApiError(
       422,
       "local_only",
@@ -177,11 +239,33 @@ export function intakeRoutes(app: FastifyInstance, s: Services) {
     );
   };
 
+  /** The registered projects a pasted text mentions, for a plan request to suggest. */
+  app.post("/v1/intakes/detect-projects", (req) => {
+    const body = parseBody(
+      z.strictObject({ text: z.string().min(1).max(MAX_PROPOSAL_TEXT_CHARS) }),
+      req.body,
+    );
+    const projects = s.knowledge.projects.list().map((p) => {
+      const aliases = p.settings["aliases"];
+      return {
+        id: p.id,
+        name: p.name,
+        repoPath: p.repoPath,
+        aliases: Array.isArray(aliases)
+          ? aliases.filter((a): a is string => typeof a === "string")
+          : [],
+      };
+    });
+    return { projects: detectProjects(body.text, projects) };
+  });
+
   app.post("/v1/intakes", sanitized, (req, reply) => {
     const body = parseBody(ManualIntake, req.body);
     refuseLocalOnlyWeb(s, body);
     requireProject(body.projectId);
     requireSkills(body.skillIds);
+    requireAcceptedDocuments(s, body.contextExecutionIds);
+    requireContextFiles(s.db, body.contextFileIds);
     const rec = s.intake().createManual(body);
     return reply.code(201).send({ intake: intakeView(rec) });
   });
@@ -193,6 +277,8 @@ export function intakeRoutes(app: FastifyInstance, s: Services) {
       throw new ApiError(503, "local_only", "local-only mode is on: ticket imports are disabled");
     if (body.projectId) requireProject(body.projectId);
     requireSkills(body.skillIds);
+    requireAcceptedDocuments(s, body.contextExecutionIds);
+    requireContextFiles(s.db, body.contextFileIds);
     const { url, projectId: given, ...work } = body;
     const projectId = given ?? (await projectForPullRequest(url));
     // 200 when the ticket was already imported: the existing intake comes back.

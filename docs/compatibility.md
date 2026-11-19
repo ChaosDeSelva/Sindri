@@ -2,7 +2,7 @@
 
 | Sindri | Mimir SDK | Mimir protocol package | Wire protocol | Brokkr SDK |
 | --- | --- | --- | --- | --- |
-| Current source checkout | 0.5.0 | 0.5.0 | 1 | 0.1.0 |
+| Current source checkout | 0.5.1 | 0.5.1 | 1 | 0.1.0 |
 | Earlier local recovery build | 0.2.0 | 0.2.0 | 1 | 0.1.0 |
 
 For change runs, pair this Sindri checkout with a Mimir server that supports the verification-time project decision log. The first writable task waits for Sindri to confirm the accepted choices. Install or build the matching server and coordinator together.

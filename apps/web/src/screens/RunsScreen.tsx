@@ -218,6 +218,15 @@ function RunDetail({
   const status = useRef<string | null>(null);
   const shown = live ?? (loaded.state.status === "ready" ? loaded.state.data : null);
   status.current = shown?.execution.status ?? null;
+  // The list reads its rows once; when the live status moves on, it reads them again so the row
+  // and this detail agree (it said "Running" while the detail said "Needs you").
+  const seenStatus = useRef<string | null>(null);
+  const liveStatus = shown?.execution.status ?? null;
+  useEffect(() => {
+    if (liveStatus === null) return;
+    if (seenStatus.current !== null && seenStatus.current !== liveStatus) onChanged();
+    seenStatus.current = liveStatus;
+  }, [liveStatus, onChanged]);
 
   // Refreshes can answer out of order: only a view newer than the one shown replaces it.
   const requested = useRef(0);
@@ -553,9 +562,7 @@ function taskColumns(d: ExecutionDetail): Column<ExecutionTask>[] {
       cell: (t) => (
         <span className="flex min-w-0 flex-col">
           <span className="font-mono text-sm [overflow-wrap:anywhere]">{t.planTaskId}</span>
-          {objective(t.planTaskId) ? (
-            <span className="text-xs font-normal text-muted">{objective(t.planTaskId)}</span>
-          ) : null}
+          {objective(t.planTaskId) ? <Objective text={objective(t.planTaskId)!} /> : null}
         </span>
       ),
     },
@@ -607,6 +614,31 @@ function taskColumns(d: ExecutionDetail): Column<ExecutionTask>[] {
       ),
     },
   ];
+}
+
+/** A task's objective, two lines until opened, so one long task does not stretch the table. */
+function Objective({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const long = text.length > 140;
+  return (
+    <span className="flex min-w-0 flex-col items-start">
+      <span
+        className={`text-xs font-normal text-muted [overflow-wrap:anywhere] ${long && !open ? "line-clamp-2" : ""}`}
+      >
+        {text}
+      </span>
+      {long ? (
+        <button
+          type="button"
+          className="text-xs font-medium text-accent-fg hover:underline"
+          aria-expanded={open}
+          onClick={() => setOpen((o) => !o)}
+        >
+          {open ? "Show less" : "Show more"}
+        </button>
+      ) : null}
+    </span>
+  );
 }
 
 function GateCell({ gate }: { gate: TaskGate | undefined }) {

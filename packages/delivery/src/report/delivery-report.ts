@@ -34,9 +34,12 @@ import {
 } from "../review/review-orchestrator.js";
 import {
   readResearchArtifacts,
+  RESEARCH_DOCUMENT_FILE,
+  RESEARCH_SOURCES_FILE,
   ResearchSourceSchema,
   type ResearchSource,
 } from "../gates/research.js";
+import { ENGINEERING_FILE, PROPOSAL_FILE } from "../gates/proposal.js";
 import type { GuidanceView, PlanView, PrDiffReader, ResearchSourcesView } from "../gates/ports.js";
 import {
   currentDraft,
@@ -136,13 +139,42 @@ export interface DeliveryReport {
     note: string;
   };
   /** `change` for plans from before work kinds. */
-  workKind: "change" | "research" | "pr_review";
+  workKind: "change" | "research" | "pr_review" | "proposal";
   /** Absent when the plan carried no guidance. */
   guidance?: GuidanceUsed;
   /** Research deliveries only. */
   research?: ResearchReport;
   /** PR review deliveries only. */
   review?: PrReviewReport;
+  /** Proposal (plan from text) deliveries only. */
+  proposal?: ProposalReport;
+}
+
+/** A recorded Markdown document of a delivery. */
+export interface RecordedDocument {
+  markdown: string;
+  artifactId: string;
+  taskId: string | null;
+}
+
+/** The documents of a proposal delivery, read from recorded artifacts only. */
+export interface ProposalReport {
+  /** The readable proposal and its engineering appendix (the writer's). */
+  proposal: RecordedDocument | null;
+  engineering: RecordedDocument | null;
+  sources: ReportSource[];
+  /** One entry per project read: the request's own (`slug: null`) and each other project. */
+  findings: {
+    planTaskId: string;
+    project: string | null;
+    slug: string | null;
+    document: RecordedDocument | null;
+    gate: { passed: boolean; failures: GateFailure[] } | null;
+  }[];
+  /** The writer's latest gate evaluation. */
+  gate: { passed: boolean; failures: GateFailure[] } | null;
+  factCheck: ResearchReport["factCheck"];
+  decision: ResearchReport["decision"];
 }
 
 /** The review part of a PR review delivery, read from recorded artifacts only. */
@@ -231,6 +263,8 @@ export interface ResearchReport {
     actor: string;
     reason: string | null;
     decidedAt: string;
+    /** The plan tasks whose request for changes this acceptance overrode. */
+    overrodeFactCheck?: string;
   } | null;
 }
 
@@ -509,12 +543,17 @@ export class DeliveryReports {
       workKind === "pr_review"
         ? await this.#prReview(executionId, plan, tasks, execTasks, artifacts)
         : undefined;
+    const proposal =
+      workKind === "proposal"
+        ? await this.#proposal(executionId, plan, tasks, execTasks, artifacts)
+        : undefined;
+    if (proposal && !proposal.proposal) limitations.push("no proposal was recorded");
     if (review && !review.hunksAvailable)
       limitations.push("the pull request's diff could not be read; located findings are general");
 
     // Summary (provider, evidence only); a research document speaks for itself --------------------
     const summary =
-      research || review
+      research || review || proposal
         ? { sentences: [], stripped: [] }
         : await this.#summary(tasks, testResults, reviewRecords, events, planIdOf, limitations);
 
@@ -556,6 +595,7 @@ export class DeliveryReports {
       ...(plan.guidance ? { guidance: guidanceUsed(plan.guidance) } : {}),
       ...(research ? { research } : {}),
       ...(review ? { review } : {}),
+      ...(proposal ? { proposal } : {}),
     };
     row.report_json = JSON.stringify(report);
     this.#db
@@ -591,50 +631,79 @@ export class DeliveryReports {
   decision(executionId: string): ResearchReport["decision"] {
     const r = this.#db
       .prepare(
-        "SELECT decision, actor, reason, decided_at FROM document_decisions WHERE execution_id = ?",
+        "SELECT decision, actor, reason, decided_at, overrode_fact_check FROM document_decisions WHERE execution_id = ?",
       )
       .get(executionId) as
-      | { decision: DocumentDecision; actor: string; reason: string | null; decided_at: string }
+      | {
+          decision: DocumentDecision;
+          actor: string;
+          reason: string | null;
+          decided_at: string;
+          overrode_fact_check: string | null;
+        }
       | undefined;
     return r
-      ? { decision: r.decision, actor: r.actor, reason: r.reason, decidedAt: r.decided_at }
+      ? {
+          decision: r.decision,
+          actor: r.actor,
+          reason: r.reason,
+          decidedAt: r.decided_at,
+          ...(r.overrode_fact_check ? { overrodeFactCheck: r.overrode_fact_check } : {}),
+        }
       : null;
   }
 
   /**
    * Ends a document delivery with a human decision. Accepting needs every quality gate passed;
-   * a decision is final.
+   * `override` accepts over a fact-check that only asked for changes (with a reason), never
+   * over a document that failed its own checks. A decision is final.
    */
   async decide(
     executionId: string,
-    input: { decision: DocumentDecision; actor: string; reason?: string },
+    input: { decision: DocumentDecision; actor: string; reason?: string; override?: boolean },
   ): Promise<DeliveryReport> {
     const execution = await this.#o.executions.execution(executionId);
     if (!execution)
       throw new DeliveryError("unknown_execution", `unknown execution ${executionId}`);
-    if (execution.plan.work?.kind !== "research")
+    const kind = execution.plan.work?.kind;
+    if (kind !== "research" && kind !== "proposal")
       throw new DeliveryError("not_a_document", "only a document delivery is accepted or rejected");
     const decided = () =>
       new DeliveryError("already_decided", "this document was already accepted or rejected", {
         decision: this.decision(executionId),
       });
     if (this.decision(executionId)) throw decided();
+    let overrode: string | null = null;
     if (input.decision === "accepted") {
       const blocked = execution.plan.tasks.filter(
         (t) => this.#o.gates.latest(executionId, t.id)?.passed !== true,
       );
-      if (blocked.length > 0)
+      const opinionOnly = (t: { id: string }) => {
+        const failures = this.#o.gates.latest(executionId, t.id)?.failures ?? [];
+        return (
+          failures.length > 0 &&
+          failures.every((f) => f.reason.split(":")[0] === "review_request_changes")
+        );
+      };
+      if (blocked.length > 0 && !(input.override && blocked.every(opinionOnly)))
         throw new DeliveryError(
           "gates_not_passed",
           `quality gates have not passed for: ${blocked.map((t) => t.id).join(", ")}`,
         );
+      if (blocked.length > 0 && !input.reason?.trim())
+        throw new DeliveryError(
+          "gates_not_passed",
+          "accepting over the fact-check's request for changes needs a reason",
+        );
+      if (blocked.length > 0) overrode = blocked.map((t) => t.id).join(", ");
     }
     const report = this.latestFor(executionId) ?? (await this.build(executionId));
     // The insert is the check: a decision that arrived while this one awaited the report wins.
     const inserted = this.#db
       .prepare(
         `INSERT INTO document_decisions (execution_id, project_id, delivery_id, decision, actor,
-           reason, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(execution_id) DO NOTHING`,
+           reason, decided_at, overrode_fact_check) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(execution_id) DO NOTHING`,
       )
       .run(
         executionId,
@@ -644,6 +713,7 @@ export class DeliveryReports {
         input.actor,
         input.reason ?? null,
         this.#now().toISOString(),
+        overrode,
       );
     if (inserted.changes === 0) throw decided();
     return this.#withDecision(report);
@@ -661,6 +731,11 @@ export class DeliveryReports {
         },
       };
     }
+    if (report.proposal)
+      return {
+        ...report,
+        proposal: { ...report.proposal, decision: this.decision(report.executionId) },
+      };
     if (!report.research) return report;
     return {
       ...report,
@@ -911,6 +986,37 @@ export class DeliveryReports {
       }
     }
     const gateOf = (id: string) => tasks.find((t) => t.planTaskId === id)?.gate ?? null;
+    const factCheck = await this.#factCheck(executionId, plan, tasks, execTasks, artifacts);
+    const gate = investigator ? gateOf(investigator.id) : null;
+    return {
+      question: settings.question ?? null,
+      sourcesAllowed: settings.sources,
+      planTaskId: investigator?.id ?? null,
+      document: read.document
+        ? {
+            markdown: read.document.text,
+            artifactId: read.document.artifactId,
+            taskId: own.find((a) => a.artifactId === read.document!.artifactId)?.taskId ?? null,
+          }
+        : null,
+      sources,
+      sourcesArtifactId: read.sources?.artifactId ?? null,
+      containsPrivateSources: sources.some((s) => s.private),
+      gate: gate ? { passed: gate.passed, failures: gate.failures } : null,
+      factCheck,
+      decision: null,
+    };
+  }
+
+  /** The verdict and findings of a document plan's reviewer, when it has one. */
+  async #factCheck(
+    executionId: string,
+    plan: PlanView,
+    tasks: DeliveryReport["tasks"],
+    execTasks: { planTaskId: string; mimirTaskId: string }[],
+    artifacts: RecordedArtifact[],
+  ): Promise<ResearchReport["factCheck"]> {
+    const gateOf = (id: string) => tasks.find((t) => t.planTaskId === id)?.gate ?? null;
     const reviewer = plan.tasks.find((t) => t.role === "reviewer");
     let factCheck: ResearchReport["factCheck"] = null;
     if (reviewer) {
@@ -940,23 +1046,63 @@ export class DeliveryReports {
         gatePassed: gate ? gate.passed : null,
       };
     }
-    const gate = investigator ? gateOf(investigator.id) : null;
+    return factCheck;
+  }
+
+  /** The latest recorded file of a name among a task lineage's artifacts, verified. */
+  async #document(own: RecordedArtifact[], name: string): Promise<RecordedDocument | null> {
+    const pick = own.filter((a) => a.name === name).at(-1);
+    if (!pick) return null;
+    const r = await readVerifiedArtifact(this.#o.mimir, this.#o.content, pick.artifactId, {
+      taskId: pick.taskId,
+      kind: pick.kind,
+    });
+    return r.ok ? { markdown: r.text, artifactId: pick.artifactId, taskId: pick.taskId } : null;
+  }
+
+  async #proposal(
+    executionId: string,
+    plan: PlanView,
+    tasks: DeliveryReport["tasks"],
+    execTasks: { planTaskId: string; mimirTaskId: string }[],
+    artifacts: RecordedArtifact[],
+  ): Promise<ProposalReport> {
+    const gateOf = (id: string) => {
+      const g = tasks.find((t) => t.planTaskId === id)?.gate;
+      return g ? { passed: g.passed, failures: g.failures } : null;
+    };
+    const own = (id: string) => this.#lineageArtifacts(executionId, id, execTasks, artifacts);
+    const refs = plan.work?.proposal?.references ?? [];
+    const findings = [];
+    for (const t of plan.tasks.filter((t) => t.role === "investigator")) {
+      const ref = refs.find((r) => `research-${r.slug}` === t.id);
+      findings.push({
+        planTaskId: t.id,
+        project: ref?.name ?? null,
+        slug: ref?.slug ?? null,
+        document: await this.#document(own(t.id), RESEARCH_DOCUMENT_FILE),
+        gate: gateOf(t.id),
+      });
+    }
+    const writer = plan.tasks.find((t) => t.id === "proposal");
+    const written = writer ? own(writer.id) : [];
+    const sourcesDoc = await this.#document(written, RESEARCH_SOURCES_FILE);
+    let sources: ReportSource[] = [];
+    if (sourcesDoc) {
+      try {
+        const parsed = ResearchSourceSchema.array().safeParse(JSON.parse(sourcesDoc.markdown));
+        if (parsed.success) sources = parsed.data;
+      } catch {
+        sources = [];
+      }
+    }
     return {
-      question: settings.question ?? null,
-      sourcesAllowed: settings.sources,
-      planTaskId: investigator?.id ?? null,
-      document: read.document
-        ? {
-            markdown: read.document.text,
-            artifactId: read.document.artifactId,
-            taskId: own.find((a) => a.artifactId === read.document!.artifactId)?.taskId ?? null,
-          }
-        : null,
+      proposal: await this.#document(written, PROPOSAL_FILE),
+      engineering: await this.#document(written, ENGINEERING_FILE),
       sources,
-      sourcesArtifactId: read.sources?.artifactId ?? null,
-      containsPrivateSources: sources.some((s) => s.private),
-      gate: gate ? { passed: gate.passed, failures: gate.failures } : null,
-      factCheck,
+      findings,
+      gate: writer ? gateOf(writer.id) : null,
+      factCheck: await this.#factCheck(executionId, plan, tasks, execTasks, artifacts),
       decision: null,
     };
   }

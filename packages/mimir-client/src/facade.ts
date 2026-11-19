@@ -4,13 +4,13 @@ import { basename } from "node:path";
 import {
   createMimirClient,
   errorFromResponse,
+  isMimirError,
   randomKey,
   type GapInfo,
   type MimirClient,
 } from "@mimir/sdk";
 import {
   parseEvent,
-  isMimirError,
   CreateTaskRequestSchema,
   type ApprovalDecision,
   type ApprovalId,
@@ -33,7 +33,12 @@ import {
 } from "@mimir/protocol";
 import { applyMigrations, type SqliteDatabase } from "@sindri/knowledge";
 import type { Plan, Role } from "@sindri/planner";
-import { mapPlan, type AgentKindResolver, type MappedPlan } from "./mapping.js";
+import {
+  mapPlan,
+  type AgentKindResolver,
+  type FallbackAgentResolver,
+  type MappedPlan,
+} from "./mapping.js";
 import { MIMIR_CLIENT_MIGRATIONS } from "./migrations.js";
 import {
   OWNED_SETTINGS,
@@ -98,6 +103,8 @@ export interface MimirClientFacadeOptions {
   acceptanceCriteriaFor?: (plan: Plan) => { id: string; text: string }[];
   /** Mimir `agentKind` per (harness, role). Default `claude` for everything. */
   agentKindFor?: AgentKindResolver;
+  /** See `MapPlanOptions.fallbackAgentFor`. */
+  fallbackAgentFor?: FallbackAgentResolver;
   /** Per-role crew concurrency, merged over the planner's `DEFAULT_CONCURRENCY`. */
   concurrency?: Partial<Record<Role, number>>;
   /** Read per plan: local-only mode refuses a plan that needs the web. */
@@ -156,6 +163,9 @@ export interface FollowStream extends AsyncIterable<MimirEvent> {
  * keys derived from the plan (`sindri:<planId>:<version>:<taskId>`), a local record of every
  * completed submission, and cursor persistence for event following.
  */
+/** Task statuses that mean a failed attempt was already sent back to work. */
+const RETRIED_STATUSES = new Set(["ready", "leased", "running", "verifying"]);
+
 export class MimirClientFacade {
   private client: MimirClient | undefined;
   private target: (ConnectConfig & { fetch: typeof fetch }) | undefined;
@@ -301,6 +311,9 @@ export class MimirClientFacade {
           ? { acceptanceCriteria: this.options.acceptanceCriteriaFor(plan) }
           : {}),
         ...(this.options.agentKindFor ? { agentKindFor: this.options.agentKindFor } : {}),
+        ...(this.options.fallbackAgentFor
+          ? { fallbackAgentFor: this.options.fallbackAgentFor }
+          : {}),
         ...(this.options.concurrency ? { concurrency: this.options.concurrency } : {}),
         ...(run !== undefined ? { run } : {}),
         ...(this.options.localOnly ? { localOnly: this.options.localOnly() } : {}),
@@ -416,6 +429,21 @@ export class MimirClientFacade {
     await this.sdk.missions.cancel(missionId as MissionId, reason ? { reason } : {}, {
       idempotencyKey: `sindri:cancel:${missionId}${why}`,
     });
+  }
+
+  /**
+   * Restarts a failed or cancelled mission: Mimir keeps completed tasks and gives the others
+   * fresh attempts. One restart per reason (the key names it, as for cancel).
+   */
+  async reopen(missionId: MissionId | string, reason: string): Promise<void> {
+    const why = createHash("sha256").update(`${reason}:${Date.now()}`).digest("hex").slice(0, 16);
+    await this.sdk.missions.reopen(
+      missionId as MissionId,
+      { reason },
+      {
+        idempotencyKey: `sindri:reopen:${missionId}:${why}`,
+      },
+    );
   }
 
   async approvalForMission(missionId: string, approvalId: string) {
@@ -569,13 +597,21 @@ export class MimirClientFacade {
     taskId: TaskId | string,
     options: { attempt?: number; reason?: string } = {},
   ): Promise<void> {
-    await this.sdk.tasks.retry(
-      taskId as TaskId,
-      options.reason ? { reason: options.reason } : {},
-      options.attempt !== undefined
-        ? { idempotencyKey: `sindri:retry:${taskId}:${options.attempt}` }
-        : {},
-    );
+    try {
+      await this.sdk.tasks.retry(
+        taskId as TaskId,
+        options.reason ? { reason: options.reason } : {},
+        options.attempt !== undefined
+          ? { idempotencyKey: `sindri:retry:${taskId}:${options.attempt}` }
+          : {},
+      );
+    } catch (err) {
+      // Mimir's scheduler retries a failed task itself while attempts remain, so this request can
+      // find the task already back in progress: that is the retry having happened, not a refusal.
+      if (!isMimirError(err) || err.code !== "invalid_transition") throw err;
+      const current = await this.sdk.tasks.get(taskId as TaskId).catch(() => null);
+      if (!current || !RETRIED_STATUSES.has(current.task.status)) throw err;
+    }
   }
 
   /** Artifact metadata. */

@@ -73,6 +73,9 @@ export interface Execution {
   createdAt: string;
   /** 1 for the first execution of a plan version, 2 for the next, ... */
   runNumber: number;
+  /** When an operator removed the run from lists (absent while it is listed). */
+  removedAt?: string;
+  removedReason?: string;
 }
 
 export interface ExecutionTask {
@@ -194,6 +197,8 @@ const BUDGET_BLOCKS = ["budget_exceeded", "budget_uncertain"] as const;
 type BudgetBlock = (typeof BUDGET_BLOCKS)[number];
 const budgetBlockOf = (reason: string | null | undefined): BudgetBlock | undefined =>
   BUDGET_BLOCKS.find((b) => reason === b || reason?.startsWith(`${b}:`));
+/** Mimir's `blockedReason` for a task whose agent cannot work; Mimir releases it itself. */
+const AGENT_UNAVAILABLE = "agent_unavailable";
 
 /** A `budget.exceeded` payload. */
 interface BudgetUse {
@@ -232,6 +237,8 @@ interface ExecutionRow {
   plan_json: string;
   created_at: string;
   run_number: number;
+  removed_at?: string | null;
+  removed_reason?: string | null;
 }
 
 interface TaskRow {
@@ -448,6 +455,92 @@ export class DeliveryLoop {
   /** Continues after a restart or a human decision, replaying from the stored cursor. */
   async resume(executionId: string, options: { signal?: AbortSignal } = {}): Promise<RunResult> {
     return this.run(executionId, options);
+  }
+
+  /**
+   * Restarts a run whose mission ended (failed, cancelled, or waiting on a task Mimir can no
+   * longer retry) from where it stopped: Mimir reopens the mission, completed tasks stay done
+   * and the others get fresh attempts; Sindri clears their escalations, skips and attempt
+   * counts and continues the run. The caller resumes the loop (`resume`).
+   */
+  async restart(executionId: string, input: { actor: string; reason: string }): Promise<Execution> {
+    const row = this.row(executionId);
+    // A run waiting on a person no longer reads Mimir's events, so it may not have seen the
+    // mission end yet: Mimir's own status settles it.
+    const ended =
+      this.missionEnded(executionId) ||
+      row.status === "cancelled" ||
+      ["failed", "cancelled"].includes(
+        (await this.mimir.getMission(row.mimir_mission_id)).mission.status,
+      );
+    const restartable =
+      row.status === "failed" ||
+      row.status === "cancelled" ||
+      (["awaiting_human", "blocked", "replan_requested"].includes(row.status) && ended);
+    if (!restartable)
+      throw new SindriError(
+        "invalid_state",
+        row.status === "verified_pending_review"
+          ? "this run finished; start the plan again to run it anew"
+          : `this run is ${row.status}; only a run that stopped can be restarted`,
+      );
+    // Whatever Mimir recorded before the restart (failures the run stopped reading when it
+    // waited on a person) is history: recorded, never acted on. Otherwise an old failure read
+    // after the restart would count against the fresh attempts and escalate the task again.
+    const backlog = await this.mimir.catchUp(row.mimir_mission_id);
+    for (const e of backlog.events) {
+      if (e.type === "mission.decision_log_requested") {
+        await this.handle(executionId, JSON.parse(row.plan_json) as Plan, e, undefined);
+      }
+    }
+    this.db.transaction(() => {
+      const seen = this.db.prepare(
+        "SELECT 1 FROM execution_events WHERE execution_id = ? AND mimir_event_id = ?",
+      );
+      const insert = this.db.prepare(
+        `INSERT INTO execution_events (id, execution_id, mimir_event_id, type, payload_json, occurred_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      for (const e of backlog.events) {
+        if (seen.get(executionId, e.id)) continue;
+        insert.run(
+          `exv_${randomUUID()}`,
+          executionId,
+          e.id,
+          e.type,
+          JSON.stringify(e.payload),
+          e.occurredAt,
+        );
+      }
+    })();
+    if (backlog.cursor) this.mimir.saveCursor(row.mimir_mission_id, backlog.cursor);
+    await this.mimir.reopen(row.mimir_mission_id, `restarted by ${input.actor}: ${input.reason}`);
+    const at = this.now().toISOString();
+    const notices: DeliveryNotice[] = [];
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE execution_tasks SET escalation = NULL, escalation_reason = NULL,
+             resolution = NULL, blocked_reason = NULL, attempts = 0
+           WHERE execution_id = ? AND status != 'completed'`,
+        )
+        .run(executionId);
+      this.db
+        .prepare(
+          `UPDATE execution_inbox SET status = 'resolved', resolved_at = ?
+           WHERE execution_id = ? AND status = 'open'`,
+        )
+        .run(at, executionId);
+      this.db.prepare("UPDATE executions SET finished_at = NULL WHERE id = ?").run(executionId);
+      this.recordSindriEvent(executionId, "execution_restarted", {
+        actor: input.actor,
+        reason: input.reason,
+        from: row.status,
+      });
+      this.setStatusIn(executionId, "running", notices);
+    })();
+    for (const n of notices) this.notify(n);
+    return this.get(executionId) as Execution;
   }
 
   /**
@@ -677,6 +770,18 @@ export class DeliveryLoop {
       createdAt: r.created_at,
       resolvedAt: r.resolved_at,
     }));
+  }
+
+  /**
+   * Hides a finished run from lists (or lists it again with `null`). Nothing else changes: its
+   * tasks, events and delivery stay, so a restore brings it back as it was.
+   */
+  setRemoved(executionId: string, removed: { at: string; reason: string } | null): Execution {
+    this.row(executionId);
+    this.db
+      .prepare("UPDATE executions SET removed_at = ?, removed_reason = ? WHERE id = ?")
+      .run(removed?.at ?? null, removed?.reason ?? null, executionId);
+    return this.get(executionId) as Execution;
   }
 
   get(executionId: string): Execution | undefined {
@@ -948,6 +1053,10 @@ export class DeliveryLoop {
         this.db.prepare("UPDATE execution_tasks SET status = ? WHERE id = ?").run(to, task.id);
       if (to && to !== "blocked" && budgetBlockOf(task.blocked_reason))
         this.budgetReleased(executionId, task, notices);
+      if (to && to !== "blocked" && task.blocked_reason?.startsWith(AGENT_UNAVAILABLE))
+        this.db
+          .prepare("UPDATE execution_tasks SET blocked_reason = NULL WHERE id = ?")
+          .run(task.id);
     }
     if (task && decision.retry) {
       this.db
@@ -1047,6 +1156,15 @@ export class DeliveryLoop {
       // in either order. Each parked task becomes an `ask` escalation, whatever the plan's
       // escalation, since only a human can raise a budget; it carries the numbers once known.
       case "task.blocked": {
+        // Mimir parks a task whose agent cannot work (usage limit, login) and runs it again at
+        // the reset or on the crew's fallback agent: the run waits, nobody needs to decide.
+        if (task && event.payload.reason === AGENT_UNAVAILABLE) {
+          const until = (event.payload as { until?: string }).until;
+          this.db
+            .prepare("UPDATE execution_tasks SET blocked_reason = ? WHERE id = ?")
+            .run(until ? `${AGENT_UNAVAILABLE}: until ${until}` : AGENT_UNAVAILABLE, task.id);
+          break;
+        }
         const block = budgetBlockOf(event.payload.reason);
         if (!task || !block) break;
         const crewId = event.crewId ?? null;
@@ -1406,13 +1524,14 @@ export class DeliveryLoop {
 
   /** True once Mimir has failed the mission: nothing runs again and a cancel is unnecessary. */
   private missionEnded(executionId: string): boolean {
-    return (
-      this.db
-        .prepare(
-          "SELECT 1 FROM execution_events WHERE execution_id = ? AND type = 'mission.failed'",
-        )
-        .get(executionId) !== undefined
-    );
+    // The latest word counts: a restart (`mission.resumed`) brings a failed mission back.
+    const last = this.db
+      .prepare(
+        `SELECT type FROM execution_events WHERE execution_id = ?
+           AND type IN ('mission.failed', 'mission.resumed') ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(executionId) as { type: string } | undefined;
+    return last?.type === "mission.failed";
   }
 
   /**
@@ -1523,6 +1642,8 @@ function toExecution(r: ExecutionRow): Execution {
     finishedAt: r.finished_at,
     createdAt: r.created_at,
     runNumber: r.run_number,
+    ...(r.removed_at ? { removedAt: r.removed_at } : {}),
+    ...(r.removed_at && r.removed_reason ? { removedReason: r.removed_reason } : {}),
   };
 }
 

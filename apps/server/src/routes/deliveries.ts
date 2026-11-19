@@ -1,4 +1,5 @@
 import { KnowledgeUpdater } from "@sindri/delivery";
+import { MAX_PROPOSAL_TEXT_CHARS } from "@sindri/intake";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { ApprovalAuthority } from "../approval.js";
@@ -38,7 +39,16 @@ async function withMimir<T>(call: () => Promise<T>): Promise<T> {
 
 const ProjectQuery = z.object({ projectId: z.string().min(1) });
 const Rework = z.strictObject({ feedback: z.string().trim().min(1).max(20_000) });
-const Accept = z.strictObject({ reason: z.string().trim().min(1).max(2000).optional() });
+const Accept = z
+  .strictObject({
+    reason: z.string().trim().min(1).max(2000).optional(),
+    // Accept over a fact-check that only asked for changes; the reason is then required.
+    override: z.boolean().optional(),
+  })
+  .refine((b) => !b.override || b.reason, {
+    message: "accepting over the fact-check needs a reason",
+    path: ["reason"],
+  });
 const Reject = z.strictObject({ reason: z.string().trim().min(1).max(2000) });
 // The research question a plan carries is at most 8000 characters (MAX_RESEARCH_QUESTION_CHARS).
 const FollowUp = z.strictObject({ question: z.string().trim().min(1).max(8000) });
@@ -86,11 +96,12 @@ export function deliveryRoutes(
     return execution;
   };
   const workKindOf = (planId: string) => f.planner.get(planId)?.work?.kind ?? "change";
-  /** A delivered research execution. */
+  /** A delivered document execution: research, or a proposal (plan from text). */
   const requireDocument = (id: string) => {
     const execution = requireDelivered(id);
-    if (workKindOf(execution.planId) !== "research")
-      throw new ApiError(409, "invalid_state", "only a research delivery is a document");
+    const kind = workKindOf(execution.planId);
+    if (kind !== "research" && kind !== "proposal")
+      throw new ApiError(409, "invalid_state", "only a research or plan delivery is a document");
     return execution;
   };
   /** Deliveries (execution ids) with a rework request being drafted right now, in this process. */
@@ -395,6 +406,7 @@ export function deliveryRoutes(
         decision: "accepted",
         actor,
         ...(body.reason ? { reason: body.reason } : {}),
+        ...(body.override ? { override: true } : {}),
       }),
     );
     req.log.info({ executionId: execution.id, actor }, "research document accepted");
@@ -428,6 +440,35 @@ export function deliveryRoutes(
       // The question alone is the request; the earlier document is linked context the planner
       // loads from `linkedExecutionId`, so it can never crowd the question out.
       const firstLine = body.question.split("\n")[0]!.slice(0, 120);
+      const proposal = plan.work?.proposal;
+      if (proposal) {
+        // A revision: the same projects and checks, the feedback first, then the original text
+        // (the writer needs it to decide); the earlier documents load from the linked run.
+        const original = earlier ? `${earlier.title}\n\n${earlier.body}` : proposal.text;
+        const revision = s.intake().createManual({
+          projectId,
+          title: `Revise: ${firstLine}`.slice(0, 120),
+          body: `Revision request:\n${body.question}\n\nOriginal text:\n${original}`.slice(
+            0,
+            MAX_PROPOSAL_TEXT_CHARS,
+          ),
+          linkedExecutionId: execution.id,
+          workKind: "proposal",
+          proposal: {
+            referenceProjectIds: proposal.references.map((r) => r.projectId),
+            sources: proposal.sources,
+            factCheck: proposal.factCheck,
+          },
+          ...(earlier?.notes ? { notes: earlier.notes } : {}),
+          ...(earlier?.skillIds.length ? { skillIds: earlier.skillIds } : {}),
+          ...(earlier?.contextExecutionIds.length
+            ? { contextExecutionIds: earlier.contextExecutionIds }
+            : {}),
+          ...(earlier?.contextFileIds.length ? { contextFileIds: earlier.contextFileIds } : {}),
+        });
+        req.log.info({ executionId: execution.id, intakeId: revision.id }, "plan revision created");
+        return reply.code(201).send({ intake: intakeView(revision) });
+      }
       const research = plan.work?.research;
       const work = {
         workKind: "research" as const,
@@ -444,6 +485,10 @@ export function deliveryRoutes(
         ...work,
         ...(earlier?.notes ? { notes: earlier.notes } : {}),
         ...(earlier?.skillIds.length ? { skillIds: earlier.skillIds } : {}),
+        ...(earlier?.contextExecutionIds.length
+          ? { contextExecutionIds: earlier.contextExecutionIds }
+          : {}),
+        ...(earlier?.contextFileIds.length ? { contextFileIds: earlier.contextFileIds } : {}),
       });
       req.log.info(
         { executionId: execution.id, intakeId: intake.id },

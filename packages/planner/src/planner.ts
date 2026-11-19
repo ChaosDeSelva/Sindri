@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import {
   createDataNonce,
@@ -58,16 +59,21 @@ import { planSystem, SKELETON_MARKER } from "./prompts.js";
 import {
   CONTEXT_TRUNCATED_MARKER,
   DEFAULT_CAPS,
+  MAX_CONTEXT_DOCUMENTS_CHARS,
   MAX_FOLLOW_UP_CONTEXT_CHARS,
   MAX_PR_BODY_CHARS,
   MAX_PR_REVIEW_FILES,
+  MAX_PROPOSAL_TEXT_CHARS,
   MAX_RESEARCH_QUESTION_CHARS,
   MAX_TASK_LESSON_CHARS,
   type Budget,
+  type ContextDocument,
+  type ContextImage,
   type Escalation,
   type Plan,
   type PlanStatus,
   type PlanWork,
+  type ProposalPlan,
   type PlanTask,
   type PrReviewPlan,
   type ProjectCaps,
@@ -92,6 +98,12 @@ export class NotSupportedYetError extends Error {
 /** Roles a research plan may hold: it reads and writes a document, never code. */
 export const RESEARCH_ROLES: readonly Role[] = ["investigator", "reviewer"];
 
+/**
+ * Roles a proposal plan may hold: investigators read the projects, a docs writer turns their
+ * findings into the proposal, a reviewer checks it. Nobody writes code.
+ */
+export const PROPOSAL_ROLES: readonly Role[] = ["investigator", "docs", "reviewer"];
+
 /** Roles a PR review plan may hold: reviewers read the PR and write a review, never code. */
 export const PR_REVIEW_ROLES: readonly Role[] = ["reviewer", "security"];
 
@@ -100,6 +112,76 @@ export const PR_REVIEW_ROLES: readonly Role[] = ["reviewer", "security"];
  * the PR facts the connector stored); null when the snapshot holds no pull request. Secrets are
  * redacted again and long text is cut. `nonce` keys the brief's data delimiters.
  */
+/** An earlier run's fact-check as its delivery report keeps it. */
+export interface EarlierFactCheck {
+  verdict?: unknown;
+  findings?: unknown;
+}
+
+/** The fact-check of an earlier document as Markdown, or "" when there was none. */
+function factCheckSection(factCheck: EarlierFactCheck | undefined): string {
+  if (!factCheck || typeof factCheck.verdict !== "string") return "";
+  const findings = Array.isArray(factCheck.findings) ? factCheck.findings : [];
+  const lines = findings.map((f) => {
+    const x = (f ?? {}) as {
+      severity?: unknown;
+      text?: unknown;
+      title?: unknown;
+      message?: unknown;
+    };
+    const text = [x.text, x.title, x.message].find((t) => typeof t === "string") as
+      string | undefined;
+    return `- ${typeof x.severity === "string" ? `[${x.severity}] ` : ""}${text ?? JSON.stringify(f)}`;
+  });
+  return `\n\n## Fact-check of the earlier document (verdict: ${factCheck.verdict})\n${lines.join("\n")}`;
+}
+
+/**
+ * An earlier document for a follow-up or revision, its fact-check first: a long plan and appendix
+ * are cut at the size limit, and a revision that lost the findings could not fix them.
+ */
+export function revisionContext(markdown: string, factCheck?: EarlierFactCheck): string {
+  const section = factCheckSection(factCheck).trim();
+  const text = redactSecrets(section ? `${section}\n\n---\n\n${markdown}` : markdown).text;
+  return text.length > MAX_FOLLOW_UP_CONTEXT_CHARS
+    ? text.slice(0, MAX_FOLLOW_UP_CONTEXT_CHARS) + CONTEXT_TRUNCATED_MARKER
+    : text;
+}
+
+/**
+ * A proposal's other projects in the request's order, each with the path its research reads
+ * (from the caller) and a unique slug. A project missing from the caller's list was deleted
+ * after the request was made; it is left out rather than planned without a path.
+ */
+function proposalReferences(
+  ids: readonly string[],
+  given: ProposeOptions["references"],
+  names: (id: string) => string | undefined,
+): ProposalPlan["references"] {
+  const taken = new Set<string>(["research"]);
+  return ids.flatMap((id) => {
+    const ref = given?.find((r) => r.projectId === id);
+    const name = names(id);
+    if (!ref || !name) return [];
+    const slug = referenceSlug(name, taken);
+    taken.add(slug);
+    return [{ projectId: id, name, slug, path: ref.path, commit: ref.commit, label: ref.label }];
+  });
+}
+
+/** `Billing API` → `billing-api`: a task id suffix and citation prefix. */
+export function referenceSlug(name: string, taken: ReadonlySet<string>): string {
+  const base =
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 36) || "project";
+  let slug = base;
+  for (let n = 2; taken.has(slug); n++) slug = `${base}-${n}`;
+  return slug;
+}
+
 export function prReviewWork(
   snapshot: { title: string; body: string; raw: unknown },
   nonce: string = createDataNonce(),
@@ -151,6 +233,16 @@ export interface ProposeOptions {
   /** See `CompleteRequest.workspace` and `workspaceLabel`. */
   workspace?: string;
   workspaceLabel?: string;
+  /**
+   * A proposal's other projects, as the caller made them readable (a snapshot of each default
+   * branch, else its checkout), in the request's order. Ignored for other kinds of work.
+   */
+  references?: readonly {
+    projectId: string;
+    path: string;
+    commit: string | null;
+    label: string;
+  }[];
 }
 
 export interface RevisePatch {
@@ -482,7 +574,7 @@ export function openPlanner(pathOrDb: string | SqliteDatabase, options: OpenPlan
   };
 
   /** The work kind and operator input of the intake the spec was drafted from. */
-  /** The research document of an earlier execution, from its stored delivery report. */
+  /** The research document of an earlier execution and its fact-check, from its delivery report. */
   const earlierDocument = (executionId: string) => {
     const has = db
       .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'deliveries'")
@@ -493,45 +585,151 @@ export function openPlanner(pathOrDb: string | SqliteDatabase, options: OpenPlan
         "SELECT report_json FROM deliveries WHERE execution_id = ? ORDER BY rowid DESC LIMIT 1",
       )
       .get(executionId) as { report_json: string } | undefined;
-    let markdown: unknown;
+    let markdown: unknown, factCheck: EarlierFactCheck | undefined;
     try {
-      markdown = row
-        ? (JSON.parse(row.report_json) as { research?: { document?: { markdown?: unknown } } })
-            .research?.document?.markdown
+      const report = row
+        ? (JSON.parse(row.report_json) as {
+            research?: { document?: { markdown?: unknown }; factCheck?: EarlierFactCheck };
+            proposal?: {
+              proposal?: { markdown?: unknown } | null;
+              engineering?: { markdown?: unknown } | null;
+              factCheck?: EarlierFactCheck;
+            };
+          })
         : undefined;
+      if (report?.proposal) {
+        // A revision reads both documents: the proposal, then its engineering appendix.
+        const p = report.proposal.proposal?.markdown;
+        const e = report.proposal.engineering?.markdown;
+        markdown =
+          typeof p === "string" && p
+            ? `${p}${typeof e === "string" && e ? `\n\n---\n\n# Engineering appendix\n\n${e}` : ""}`
+            : undefined;
+        factCheck = report.proposal.factCheck ?? undefined;
+      } else {
+        markdown = report?.research?.document?.markdown;
+        factCheck = report?.research?.factCheck;
+      }
     } catch {
       markdown = undefined;
     }
     if (typeof markdown !== "string" || !markdown) return null;
-    const text = redactSecrets(markdown).text;
-    return {
-      executionId,
-      document:
-        text.length > MAX_FOLLOW_UP_CONTEXT_CHARS
-          ? text.slice(0, MAX_FOLLOW_UP_CONTEXT_CHARS) + CONTEXT_TRUNCATED_MARKER
-          : text,
-    };
+    return { executionId, document: revisionContext(markdown, factCheck) };
+  };
+
+  /**
+   * The accepted documents a request names as context: a plan (with its appendix) or a research
+   * document, as their delivery report keeps them, sharing one size budget. A document no longer
+   * accepted, or without a report, is left out.
+   */
+  const contextDocuments = (
+    executionIds: readonly string[],
+    fileIds: readonly string[],
+  ): { documents: ContextDocument[]; images: ContextImage[] } => {
+    const tables = new Set(
+      (
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('deliveries', 'document_decisions')",
+          )
+          .all() as { name: string }[]
+      ).map((t) => t.name),
+    );
+    const found: { executionId?: string; fileId?: string; title: string; markdown: string }[] = [];
+    const images: ContextImage[] = [];
+    const hasFiles = db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'context_files'")
+      .get();
+    for (const fileId of hasFiles ? fileIds : []) {
+      const f = db
+        .prepare("SELECT name, kind, path FROM context_files WHERE id = ?")
+        .get(fileId) as { name: string; kind: string; path: string } | undefined;
+      if (!f || !existsSync(f.path)) continue;
+      if (f.kind === "image") images.push({ fileId, name: f.name, path: f.path });
+      else found.push({ fileId, title: f.name, markdown: readFileSync(f.path, "utf8") });
+    }
+    const documentsOk = tables.has("deliveries") && tables.has("document_decisions");
+    for (const executionId of documentsOk ? executionIds : []) {
+      const accepted = db
+        .prepare(
+          "SELECT 1 FROM document_decisions WHERE execution_id = ? AND decision = 'accepted'",
+        )
+        .get(executionId);
+      if (!accepted) continue;
+      const row = db
+        .prepare(
+          "SELECT report_json FROM deliveries WHERE execution_id = ? ORDER BY rowid DESC LIMIT 1",
+        )
+        .get(executionId) as { report_json: string } | undefined;
+      let markdown: string | undefined;
+      try {
+        const report = row
+          ? (JSON.parse(row.report_json) as {
+              research?: { document?: { markdown?: unknown } };
+              proposal?: {
+                proposal?: { markdown?: unknown } | null;
+                engineering?: { markdown?: unknown } | null;
+              };
+            })
+          : undefined;
+        const p = report?.proposal?.proposal?.markdown;
+        const e = report?.proposal?.engineering?.markdown;
+        const r = report?.research?.document?.markdown;
+        markdown =
+          typeof p === "string" && p
+            ? `${p}${typeof e === "string" && e ? `\n\n---\n\n# Engineering appendix\n\n${e}` : ""}`
+            : typeof r === "string" && r
+              ? r
+              : undefined;
+      } catch {
+        markdown = undefined;
+      }
+      if (!markdown) continue;
+      const heading = /^#\s+(.+)$/m.exec(markdown)?.[1]?.trim();
+      found.push({ executionId, title: (heading ?? executionId).slice(0, 500), markdown });
+    }
+    const each = found.length ? Math.floor(MAX_CONTEXT_DOCUMENTS_CHARS / found.length) : 0;
+    const documents = found.map((d) => {
+      const text = redactSecrets(d.markdown).text;
+      return {
+        ...(d.executionId ? { executionId: d.executionId } : {}),
+        ...(d.fileId ? { fileId: d.fileId } : {}),
+        title: d.title,
+        document: text.length > each ? text.slice(0, each) + "\n[document truncated]" : text,
+      };
+    });
+    return { documents, images };
   };
 
   const loadWork = (specId: string) => {
     const r = db
       .prepare(
-        `SELECT i.work_kind, i.research_json, i.notes, i.skill_ids_json, i.title,
-           i.raw_snapshot_json, i.linked_execution_id FROM specifications s
+        `SELECT i.work_kind, i.research_json, i.proposal_json, i.notes, i.skill_ids_json,
+           i.title, i.raw_snapshot_json, i.linked_execution_id, i.context_json,
+           i.context_files_json FROM specifications s
          JOIN intakes i ON i.id = s.intake_id WHERE s.id = ?`,
       )
       .get(specId) as
       | {
           work_kind: PlanWork["kind"];
           research_json: string | null;
+          proposal_json: string | null;
           notes: string;
           skill_ids_json: string;
           title: string;
           raw_snapshot_json: string;
           linked_execution_id: string | null;
+          context_json: string | null;
+          context_files_json: string | null;
         }
       | undefined;
     const work: PlanWork = { kind: r?.work_kind ?? "change" };
+    const contextIds = r?.context_json ? (JSON.parse(r.context_json) as string[]) : [];
+    const fileIds = r?.context_files_json ? (JSON.parse(r.context_files_json) as string[]) : [];
+    const { documents, images } = contextDocuments(contextIds, fileIds);
+    if (documents.length) work.documents = documents;
+    if (images.length) work.images = images;
+    let referenceIds: string[] = [];
     if (work.kind === "pr_review") {
       const snapshot = r
         ? (JSON.parse(r.raw_snapshot_json) as { body?: string; raw?: unknown })
@@ -557,8 +755,30 @@ export function openPlanner(pathOrDb: string | SqliteDatabase, options: OpenPlan
         ...(context ? { context } : {}),
       };
     }
+    if (work.kind === "proposal" && r?.proposal_json) {
+      const options = JSON.parse(r.proposal_json) as {
+        referenceProjectIds: string[];
+        sources: { code: boolean; web: boolean };
+        factCheck: boolean;
+      };
+      const body = (JSON.parse(r.raw_snapshot_json) as { body?: string }).body ?? "";
+      work.proposal = {
+        text: redactSecrets(`${r.title}\n\n${body}`.trim()).text.slice(
+          0,
+          MAX_PROPOSAL_TEXT_CHARS + 600,
+        ),
+        sources: options.sources,
+        factCheck: options.factCheck,
+        // Filled in by propose from the paths the caller made readable.
+        references: [],
+      };
+      const context = r.linked_execution_id ? earlierDocument(r.linked_execution_id) : null;
+      if (context) work.proposal.context = context;
+      referenceIds = options.referenceProjectIds;
+    }
     return {
       work,
+      referenceIds,
       notes: r?.notes ?? "",
       skillIds: r ? (JSON.parse(r.skill_ids_json) as string[]) : [],
     };
@@ -658,6 +878,51 @@ export function openPlanner(pathOrDb: string | SqliteDatabase, options: OpenPlan
           ),
         });
       return review;
+    }
+    if (work.kind === "proposal") {
+      // One investigator per project, in parallel: the request's own project, then each other
+      // project it reads. A docs writer turns all their findings into the proposal and its
+      // engineering appendix; an optional reviewer checks both. Every task carries every
+      // criterion: the documents are the whole deliverable.
+      const all = spec.body.acceptanceCriteria.map((a) => a.id);
+      const selection = await select(
+        harnesses,
+        "research",
+        descriptor(
+          "research",
+          ["research", "investigation", "docs"],
+          all,
+          [],
+          `Research and plan: ${spec.title}`,
+        ),
+      );
+      const research = [
+        "research",
+        ...(work.proposal?.references ?? []).map((r) => `research-${r.slug}`),
+      ];
+      const tasks: SkeletonTask[] = research.map((id) => ({
+        id,
+        role: "investigator" as const,
+        acceptanceCriteria: [...all],
+        dependsOn: [],
+        selection,
+      }));
+      tasks.push({
+        id: "proposal",
+        role: "docs",
+        acceptanceCriteria: [...all],
+        dependsOn: research,
+        selection,
+      });
+      if (work.proposal?.factCheck ?? true)
+        tasks.push({
+          id: "fact-check",
+          role: "reviewer",
+          acceptanceCriteria: [...all],
+          dependsOn: ["proposal"],
+          selection,
+        });
+      return tasks;
     }
     if (work.kind === "research") {
       // One investigator answers the question in a document; an optional reviewer then
@@ -858,7 +1123,17 @@ export function openPlanner(pathOrDb: string | SqliteDatabase, options: OpenPlan
       if (spec.status !== "approved")
         throw new PlanStateError(`specification ${spec.id} must be approved before planning`);
       const caps = capsFor(opts.caps);
-      const { work, notes, skillIds } = loadWork(spec.id);
+      const { work, notes, skillIds, referenceIds } = loadWork(spec.id);
+      if (work.proposal)
+        work.proposal.references = proposalReferences(
+          referenceIds,
+          opts.references,
+          (id) =>
+            (
+              db.prepare("SELECT name FROM projects WHERE id = ?").get(id) as
+                { name: string } | undefined
+            )?.name,
+        );
       const areas = work.kind === "change" ? deriveWorkAreas(spec.body, opts.repoIndex) : [];
       if (work.kind === "change" && areas.length === 0)
         throw new PlanValidationError([
@@ -1066,7 +1341,19 @@ export function openPlanner(pathOrDb: string | SqliteDatabase, options: OpenPlan
           ? RESEARCH_ROLES
           : prev.work?.kind === "pr_review"
             ? PR_REVIEW_ROLES
-            : null;
+            : prev.work?.kind === "proposal"
+              ? PROPOSAL_ROLES
+              : null;
+      if (prev.work?.kind === "proposal") {
+        // Briefs find each project's findings and the proposal by task id; they must stay.
+        const lost = prev.tasks
+          .filter((t) => t.role === "investigator" || t.id === "proposal")
+          .filter((t) => !patch.tasks.some((n) => n.id === t.id && n.role === t.role));
+        if (lost.length > 0)
+          throw new PlanValidationError(
+            lost.map((t) => `${t.id}: a proposal plan keeps its ${t.role} task id`),
+          );
+      }
       if (prev.work?.kind === "research") {
         // Briefs and gates find the research document by its task id; it must stay.
         const lost = prev.tasks
@@ -1083,7 +1370,7 @@ export function openPlanner(pathOrDb: string | SqliteDatabase, options: OpenPlan
           throw new PlanValidationError(
             wrong.map(
               (t) =>
-                `${t.id}: a ${prev.work?.kind === "research" ? "research" : "PR review"} plan cannot hold a ${t.role} task`,
+                `${t.id}: a ${{ research: "research", pr_review: "PR review", proposal: "proposal" }[prev.work!.kind as "research"] ?? "PR review"} plan cannot hold a ${t.role} task`,
             ),
           );
       }

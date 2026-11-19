@@ -6,6 +6,9 @@ importers:
   .:
     configDependencies: {}
     packageManagerDependencies:
+      '@pnpm/exe':
+        specifier: 12.11.2
+        version: 12.11.2
       pnpm:
         specifier: 12.11.2
         version: 12.11.2
@@ -89,6 +92,11 @@ packages:
     cpu: [x64]
     os: [win32]
 
+  '@pnpm/exe@12.11.2':
+    resolution: {integrity: sha512-uUudrvXShgp6yYRL/6XjeB2B2kbjE/alBdVWjFBP0jDiOnV5R83OpCWuGtc+Tn4stk0DEgO/x+vhEUTUf4x+Yw==}
+    engines: {node: '>=18.*'}
+    hasBin: true
+
   pnpm@12.11.2:
     resolution: {integrity: sha512-JaUWUqGWeFr18ovabf6NxYLr76SsHRgCIc4TkCMcX7dmN4IupLbkYzznSs3LCnf3Ja8RutOBd/3t2u6BipVcuQ==}
     engines: {node: '>=18.*'}
@@ -138,6 +146,23 @@ snapshots:
   '@pnpm/exe.win32-x64@12.11.2':
     optional: true
 
+  '@pnpm/exe@12.11.2':
+    optionalDependencies:
+      '@pnpm/exe.android-arm64': 12.11.2
+      '@pnpm/exe.android-x64': 12.11.2
+      '@pnpm/exe.darwin-arm64': 12.11.2
+      '@pnpm/exe.darwin-x64': 12.11.2
+      '@pnpm/exe.freebsd-x64': 12.11.2
+      '@pnpm/exe.linux-arm64': 12.11.2
+      '@pnpm/exe.linux-arm64-musl': 12.11.2
+      '@pnpm/exe.linux-ppc64': 12.11.2
+      '@pnpm/exe.linux-riscv64': 12.11.2
+      '@pnpm/exe.linux-s390x': 12.11.2
+      '@pnpm/exe.linux-x64': 12.11.2
+      '@pnpm/exe.linux-x64-musl': 12.11.2
+      '@pnpm/exe.win32-arm64': 12.11.2
+      '@pnpm/exe.win32-x64': 12.11.2
+
   pnpm@12.11.2:
     optionalDependencies:
       '@pnpm/exe.android-arm64': 12.11.2
@@ -163,7 +188,7 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
-  '@mimir/protocol': file:vendor/mimir/mimir-protocol-0.5.0.tgz
+  '@mimir/protocol': file:vendor/mimir/mimir-protocol-0.5.1.tgz
   '@brokkr/adapter-claude-code': file:vendor/brokkr/brokkr-adapter-claude-code-0.1.0.tgz
   '@brokkr/adapter-codex': file:vendor/brokkr/brokkr-adapter-codex-0.1.0.tgz
   '@brokkr/adapter-generic': file:vendor/brokkr/brokkr-adapter-generic-0.1.0.tgz
@@ -301,11 +326,11 @@ importers:
   apps/web:
     dependencies:
       '@factory/docs':
-        specifier: file:../../vendor/factory/factory-docs-0.1.7.tgz
-        version: file:vendor/factory/factory-docs-0.1.7.tgz
+        specifier: file:../../vendor/factory/factory-docs-0.1.13.tgz
+        version: file:vendor/factory/factory-docs-0.1.13.tgz
       '@factory/ui':
-        specifier: file:../../vendor/factory/factory-ui-0.1.9.tgz
-        version: file:vendor/factory/factory-ui-0.1.9.tgz(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+        specifier: file:../../vendor/factory/factory-ui-0.1.18.tgz
+        version: file:vendor/factory/factory-ui-0.1.18.tgz(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       react:
         specifier: ^19.3.0
         version: 19.3.0
@@ -509,11 +534,11 @@ importers:
   packages/mimir-client:
     dependencies:
       '@mimir/protocol':
-        specifier: file:../../vendor/mimir/mimir-protocol-0.5.0.tgz
-        version: file:vendor/mimir/mimir-protocol-0.5.0.tgz
+        specifier: file:../../vendor/mimir/mimir-protocol-0.5.1.tgz
+        version: file:vendor/mimir/mimir-protocol-0.5.1.tgz
       '@mimir/sdk':
-        specifier: file:../../vendor/mimir/mimir-sdk-0.5.0.tgz
-        version: file:vendor/mimir/mimir-sdk-0.5.0.tgz
+        specifier: file:../../vendor/mimir/mimir-sdk-0.5.1.tgz
+        version: file:vendor/mimir/mimir-sdk-0.5.1.tgz
       '@sindri/knowledge':
         specifier: workspace:*
         version: link:../knowledge
@@ -603,15 +628,15 @@ importers:
   packages/testing:
     dependencies:
       '@mimir/protocol':
-        specifier: file:../../vendor/mimir/mimir-protocol-0.5.0.tgz
-        version: file:vendor/mimir/mimir-protocol-0.5.0.tgz
+        specifier: file:../../vendor/mimir/mimir-protocol-0.5.1.tgz
+        version: file:vendor/mimir/mimir-protocol-0.5.1.tgz
       zod:
         specifier: ^4.6.7
         version: 4.6.7
     devDependencies:
       '@mimir/sdk':
-        specifier: file:../../vendor/mimir/mimir-sdk-0.5.0.tgz
-        version: file:vendor/mimir/mimir-sdk-0.5.0.tgz
+        specifier: file:../../vendor/mimir/mimir-sdk-0.5.1.tgz
+        version: file:vendor/mimir/mimir-sdk-0.5.1.tgz
       typescript:
         specifier: ~6.0.3
         version: 6.0.3
@@ -712,7 +737,7 @@ packages:
     engines: {node: '>=25'}
 
   '@brokkr/registry@file:vendor/brokkr/brokkr-registry-0.1.0.tgz':
-    resolution: {integrity: sha512-XJg47xogx0oMdXCKkLDLo6+bcJCty5/Lzt9F/pX8+U0QUWsSQzIEg9t1dfAqQzUDx2KbPljmkp/QO1cTcL5CkQ==, tarball: file:vendor/brokkr/brokkr-registry-0.1.0.tgz}
+    resolution: {integrity: sha512-qbO+YtR4tVttdqQztlzRbHBNq2s9udQBjBK1IOMj1bHZucHLq6X0uYrlASbakv0Vj1JA2CkNaIyI552bA4YPjA==, tarball: file:vendor/brokkr/brokkr-registry-0.1.0.tgz}
     version: 0.1.0
     engines: {node: '>=25'}
 
@@ -727,7 +752,7 @@ packages:
     engines: {node: '>=25'}
 
   '@brokkr/runner@file:vendor/brokkr/brokkr-runner-0.1.0.tgz':
-    resolution: {integrity: sha512-MUYAg9CWRVjxyOTkexmrB22Gle1H9sQABa7vjtqLB77p091df0+l7pTLozA+uf074S14uDSXM5CCJlEUAo1UqQ==, tarball: file:vendor/brokkr/brokkr-runner-0.1.0.tgz}
+    resolution: {integrity: sha512-ErtmuTRL3pTE8zvpUxSvXyF35Q4+rAXYCuQCqW+/80RsdAh3pEcs7VHZtjsI9WTzTZ/aDHVDYtOmgsm39y755g==, tarball: file:vendor/brokkr/brokkr-runner-0.1.0.tgz}
     version: 0.1.0
     engines: {node: '>=25'}
 
@@ -982,14 +1007,19 @@ packages:
       '@noble/hashes':
         optional: true
 
+  '@factory/docs@file:vendor/factory/factory-docs-0.1.13.tgz':
+    resolution: {integrity: sha512-ongqf9D1DGGIHOWcGZ915HdLAdg7cQ8KLAZ5gj8lg7p/Xu6ng5/rC9ebmBlqLames9cxHXITtnPc+svLDxBRNw==, tarball: file:vendor/factory/factory-docs-0.1.13.tgz}
+    version: 0.1.13
+    engines: {node: '>=24'}
+
   '@factory/docs@file:vendor/factory/factory-docs-0.1.7.tgz':
     resolution: {integrity: sha512-Y0f02dbhYiCqNJ5PYKil9xBm7f/pjeLLRmCwTKicx3rbxLYRhQzfK0s5v+8QLds6Y+1GZrAESb4P72gJoeSYGw==, tarball: file:vendor/factory/factory-docs-0.1.7.tgz}
     version: 0.1.7
     engines: {node: '>=24'}
 
-  '@factory/ui@file:vendor/factory/factory-ui-0.1.9.tgz':
-    resolution: {integrity: sha512-f4vbKwYsnJo5fgL4S/tDwnP3K/cbYkUqQE/3niFSRqN1CFAF2mlYLsdJ7I7YzcnNiQ8KzIXIibWPH26+428hcA==, tarball: file:vendor/factory/factory-ui-0.1.9.tgz}
-    version: 0.1.9
+  '@factory/ui@file:vendor/factory/factory-ui-0.1.18.tgz':
+    resolution: {integrity: sha512-qcbTRIFJ7PZh5QRiSaebeA+wKeeEUnIbAJI8ZSyx+T+naPEsAfZgN1Po4laNInnDtTFQ17wB03Mvv3MGXMnIeA==, tarball: file:vendor/factory/factory-ui-0.1.18.tgz}
+    version: 0.1.18
     engines: {node: '>=24'}
     peerDependencies:
       react: ^19.3.0
@@ -1076,13 +1106,13 @@ packages:
   '@keyv/serialize@1.1.1':
     resolution: {integrity: sha512-dXn3FZhPv0US+7dtJsIi2R+c7qWYiReoEh5zUntWCf4oSpMNib8FDhSoed6m3QyZdx5hK7iLFkYk3rNxwt8vTA==}
 
-  '@mimir/protocol@file:vendor/mimir/mimir-protocol-0.5.0.tgz':
-    resolution: {integrity: sha512-qXCgvIqEB1meesXvmIIK2GmGdq/qsGr/YIf5DM13TjI4q7wnPk13sQzqtYi02+J5/im240p9z6cv2aGKW3KDTw==, tarball: file:vendor/mimir/mimir-protocol-0.5.0.tgz}
-    version: 0.5.0
+  '@mimir/protocol@file:vendor/mimir/mimir-protocol-0.5.1.tgz':
+    resolution: {integrity: sha512-TiUMEXEmDSTyqlbtlYrcvev62aTOEQkZTLbCuv4rz8qrPO/60lSItn+fTsNOyo8oEJ0TARUIz7WTbCUdHzNy/A==, tarball: file:vendor/mimir/mimir-protocol-0.5.1.tgz}
+    version: 0.5.1
 
-  '@mimir/sdk@file:vendor/mimir/mimir-sdk-0.5.0.tgz':
-    resolution: {integrity: sha512-IKHBZIPhzk3ULoixI7UgK99ZJE8fgedZM0iJan5HZQkdUObGV7tqZyfHWFQq9x2dx0hfygUGPn7aGLzMlnai1g==, tarball: file:vendor/mimir/mimir-sdk-0.5.0.tgz}
-    version: 0.5.0
+  '@mimir/sdk@file:vendor/mimir/mimir-sdk-0.5.1.tgz':
+    resolution: {integrity: sha512-1KlkygQ0Ev5JQyd2uabcHwQTKXWDjNLSAQvspxEe96UXg48pqgnPta8fM7AfD/2HF1symn8JIQSF65ofPfHuZg==, tarball: file:vendor/mimir/mimir-sdk-0.5.1.tgz}
+    version: 0.5.1
 
   '@oxc-project/types@0.153.0':
     resolution: {integrity: sha512-jSNrRIyvPVLL5E1z/tS5zLAprosGz/FuI1PWwEOz59j3E4TTTzSpqKb/RDGqJhhW0QHYISGXxq582wGx6T11Tw==}
@@ -3221,9 +3251,11 @@ snapshots:
 
   '@exodus/bytes@1.16.0': {}
 
+  '@factory/docs@file:vendor/factory/factory-docs-0.1.13.tgz': {}
+
   '@factory/docs@file:vendor/factory/factory-docs-0.1.7.tgz': {}
 
-  '@factory/ui@file:vendor/factory/factory-ui-0.1.9.tgz(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
+  '@factory/ui@file:vendor/factory/factory-ui-0.1.18.tgz(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
     dependencies:
       '@radix-ui/react-dialog': 1.3.1(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       '@radix-ui/react-dropdown-menu': 2.2.1(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
@@ -3325,15 +3357,15 @@ snapshots:
 
   '@keyv/serialize@1.1.1': {}
 
-  '@mimir/protocol@file:vendor/mimir/mimir-protocol-0.5.0.tgz':
+  '@mimir/protocol@file:vendor/mimir/mimir-protocol-0.5.1.tgz':
     dependencies:
       '@asteasolutions/zod-to-openapi': 9.1.0(zod@4.6.7)
       ulid: 3.0.2
       zod: 4.6.7
 
-  '@mimir/sdk@file:vendor/mimir/mimir-sdk-0.5.0.tgz':
+  '@mimir/sdk@file:vendor/mimir/mimir-sdk-0.5.1.tgz':
     dependencies:
-      '@mimir/protocol': file:vendor/mimir/mimir-protocol-0.5.0.tgz
+      '@mimir/protocol': file:vendor/mimir/mimir-protocol-0.5.1.tgz
 
   '@oxc-project/types@0.153.0': {}
 

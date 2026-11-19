@@ -91,12 +91,16 @@ export const EstimatesSchema = z.object({
 export type Estimates = z.infer<typeof EstimatesSchema>;
 
 /** What a plan delivers; the intake's work kind decides the skeleton. */
-export const WORK_KINDS = ["change", "research", "pr_review"] as const;
+export const WORK_KINDS = ["change", "research", "pr_review", "proposal"] as const;
 export type PlanWorkKind = (typeof WORK_KINDS)[number];
 
-export const MAX_RESEARCH_QUESTION_CHARS = 8000;
-/** The earlier document a follow-up question carries as context, at most this long. */
-export const MAX_FOLLOW_UP_CONTEXT_CHARS = 24_000;
+/**
+ * The request a research agent is given, at most this long: a whole intake (a pasted call
+ * transcript runs to tens of thousands of characters), well under the OS argument limit.
+ */
+export const MAX_RESEARCH_QUESTION_CHARS = 120_000;
+/** The earlier document (and its fact-check) a follow-up question carries, at most this long. */
+export const MAX_FOLLOW_UP_CONTEXT_CHARS = 120_000;
 export const CONTEXT_TRUNCATED_MARKER = "\n[earlier document truncated]";
 
 export const ResearchPlanSchema = z
@@ -149,11 +153,81 @@ export const PrReviewPlanSchema = z
   .strict();
 export type PrReviewPlan = z.infer<typeof PrReviewPlanSchema>;
 
+/** A proposal's pasted text (a call transcript, notes), at most this long. */
+export const MAX_PROPOSAL_TEXT_CHARS = 200_000;
+
+/** Another project a proposal reads, read-only, as of planning. */
+export const ProposalReferenceSchema = z
+  .object({
+    projectId: z.string().min(1),
+    name: z.string().min(1),
+    /** The task id suffix and citation prefix: `research-<slug>`, `<slug>/path:line`. */
+    slug: z.string().regex(/^[a-z0-9][a-z0-9-]{0,40}$/),
+    /** Where its research task reads it: a snapshot of its default branch, else its checkout. */
+    path: z.string().min(1),
+    commit: z
+      .string()
+      .regex(/^[0-9a-f]{40}$/)
+      .nullable(),
+    label: z.string(),
+  })
+  .strict();
+
+export const ProposalPlanSchema = z
+  .object({
+    /** The pasted text as given (title and body, secrets redacted). */
+    text: z.string().max(MAX_PROPOSAL_TEXT_CHARS + 600),
+    sources: z.object({ code: z.boolean(), web: z.boolean() }).strict(),
+    factCheck: z.boolean(),
+    references: z.array(ProposalReferenceSchema).max(8),
+    /** A revision's earlier proposal and appendix (secrets redacted, cut with a marker). */
+    context: z
+      .object({
+        executionId: z.string().min(1),
+        document: z.string().max(MAX_FOLLOW_UP_CONTEXT_CHARS + 64),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+export type ProposalPlan = z.infer<typeof ProposalPlanSchema>;
+
+/** Accepted documents an operator gave a request as context, together at most this long. */
+export const MAX_CONTEXT_DOCUMENTS_CHARS = 120_000;
+
+export const ContextDocumentSchema = z
+  .object({
+    /** The run of an accepted document, or the id of an uploaded Markdown file. */
+    executionId: z.string().min(1).optional(),
+    fileId: z.string().min(1).optional(),
+    title: z.string().max(500),
+    document: z.string().max(MAX_CONTEXT_DOCUMENTS_CHARS + 64),
+  })
+  .strict();
+export type ContextDocument = z.infer<typeof ContextDocumentSchema>;
+
+/** An uploaded image the operator gave a request as context; agents may open its file. */
+export const ContextImageSchema = z
+  .object({
+    fileId: z.string().min(1),
+    name: z.string().max(300),
+    path: z
+      .string()
+      .regex(/^\/[^\0]*$/)
+      .max(1024),
+  })
+  .strict();
+export type ContextImage = z.infer<typeof ContextImageSchema>;
+
 export const PlanWorkSchema = z
   .object({
     kind: z.enum(WORK_KINDS),
     research: ResearchPlanSchema.optional(),
     prReview: PrReviewPlanSchema.optional(),
+    proposal: ProposalPlanSchema.optional(),
+    /** Accepted plans or research documents the operator chose as context, for every task. */
+    documents: z.array(ContextDocumentSchema).max(5).optional(),
+    images: z.array(ContextImageSchema).max(5).optional(),
   })
   .strict();
 export type PlanWork = z.infer<typeof PlanWorkSchema>;

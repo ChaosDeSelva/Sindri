@@ -21,6 +21,8 @@ const Decide = z.strictObject({
   reason: z.string().trim().min(1).max(2000).optional(),
 });
 const Cancel = z.strictObject({ reason: z.string().trim().min(1).max(2000).optional() });
+const Restart = z.strictObject({ reason: z.string().trim().min(1).max(2000) });
+const Remove = z.strictObject({ reason: z.string().trim().min(1).max(2000) });
 const Resolve = z.strictObject({
   decision: z.enum(["retry", "skip", "replan", "abort"]),
   reason: z.string().trim().min(1).max(2000),
@@ -197,9 +199,12 @@ export function executionRoutes(
   });
 
   app.get<{ Querystring: { projectId?: string } }>("/v1/executions", (req) => {
-    const q = parseBody(z.object({ projectId: z.string().min(1) }), req.query);
+    const q = parseBody(
+      z.object({ projectId: z.string().min(1), removed: z.enum(["0", "1"]).optional() }),
+      req.query,
+    );
     if (!s.knowledge.projects.get(q.projectId)) throw notFound("project");
-    return { executions: executionsByProject(s.db, q.projectId) };
+    return { executions: executionsByProject(s.db, q.projectId, { removed: q.removed === "1" }) };
   });
 
   app.get<IdParams>("/v1/executions/:id", (req) => view(req.params.id));
@@ -344,6 +349,58 @@ export function executionRoutes(
     } catch (err) {
       throw asMimirUnavailable(err);
     }
+    return view(id);
+  });
+
+  /**
+   * Restarts a run that stopped (failed, cancelled, or waiting on a task Mimir can no longer
+   * retry) from where it stopped: completed tasks are kept, the rest run again with fresh
+   * attempts. Nothing that already finished runs twice.
+   */
+  app.post<IdParams>("/v1/executions/:id/restart", async (req) => {
+    const { id } = req.params;
+    if (requireExecution(id).removedAt)
+      throw new ApiError(409, "invalid_state", "the run was removed; restore it before restarting");
+    const body = parseBody(Restart, req.body);
+    try {
+      // The run continues in the background, as the execution's consumer.
+      await hub.takeover(id, async ({ loop }, signal) => {
+        await loop.restart(id, { actor: "user", reason: body.reason });
+        await loop.resume(id, { signal });
+      });
+    } catch (err) {
+      throw asMimirUnavailable(err);
+    }
+    req.log.info({ executionId: id }, "execution restarted");
+    return view(id);
+  });
+
+  /**
+   * Removes a finished run from every list (runs, deliveries, documents, counts). Its records
+   * are kept, so `restore` lists it again unchanged. A run still going must be cancelled first.
+   */
+  app.post<IdParams>("/v1/executions/:id/remove", (req) => {
+    const { id } = req.params;
+    const execution = requireExecution(id);
+    const body = parseBody(Remove, req.body);
+    if (!FINAL_STATUSES.has(execution.status))
+      throw new ApiError(
+        409,
+        "invalid_state",
+        `the run is ${execution.status}; cancel it before removing it`,
+      );
+    if (!execution.removedAt)
+      hub.reader.setRemoved(id, { at: new Date().toISOString(), reason: body.reason });
+    req.log.info({ executionId: id }, "execution removed");
+    return view(id);
+  });
+
+  /** Lists a removed run again, as it was. */
+  app.post<IdParams>("/v1/executions/:id/restore", (req) => {
+    const { id } = req.params;
+    parseBody(Cancel, req.body);
+    if (requireExecution(id).removedAt) hub.reader.setRemoved(id, null);
+    req.log.info({ executionId: id }, "execution restored");
     return view(id);
   });
 
